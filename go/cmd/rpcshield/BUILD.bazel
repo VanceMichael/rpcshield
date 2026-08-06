@@ -1,0 +1,22 @@
+load("@io_bazel_rules_go//go:def.bzl", "go_binary", "go_library")
+
+go_library(
+    name = "rpcshield_lib",
+    srcs = ["main.go"],
+    importpath = "github.com/uber-research/rpcshield/go/cmd/rpcshield",
+    visibility = ["//visibility:private"],
+    deps = [
+        "//cmd/rpcshield/common:go_default_library",
+        "//cmd/rpcshield/jsonmode:go_default_library",
+        "//cmd/rpcshield/wpamode:go_default_library",
+        "//constant:go_default_library",
+        "//genai:go_default_library",
+        "@org_uber_go_zap//:go_default_library",
+    ],
+)
+
+go_binary(
+    name = "rpcshield",
+    embed = [":rpcshield_lib"],
+    visibility = ["//visibility:public"],
+)

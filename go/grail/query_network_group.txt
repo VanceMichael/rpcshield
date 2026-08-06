@@ -1,0 +1,17 @@
+swn::*:* (
+  FIELD __id AS group
+  SCAN up::environment AS environment (
+    FOLLOW up::service AS service (
+      # Remove "uber::service:" prefix from __id to form the service name.
+      FIELD substr(__id, 14, len(__id)) AS __id
+    )
+    WHERE not isNull(service.__id)
+
+    FIELD service.__id AS service_names
+    EXCLUDE __id
+  )
+  FIELD distinct(environment.service_names) AS service_names
+  WHERE len(service_names) > 0
+  EXCLUDE environment
+  EXCLUDE __id
+)

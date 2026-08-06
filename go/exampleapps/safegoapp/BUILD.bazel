@@ -1,0 +1,27 @@
+# keep
+load("@io_bazel_rules_go//go:def.bzl", "go_binary", "go_library", "go_path")
+
+go_library(
+    name = "go_default_library",
+    srcs = ["app.go"],
+    importpath = "github.com/uber-research/rpcshield/go/exampleapps/safegoapp",
+    visibility = ["//visibility:private"],
+    deps = [
+        "//features/safego:go_default_library",
+    ],
+)
+
+go_binary(
+    name = "safegoapp",
+    embed = [":go_default_library"],
+    visibility = ["//visibility:public"],
+)
+
+# graph/safegoenricher_test.go uses this example as test input.
+go_path(
+    name = "safegoapp-anal",
+    testonly = True,
+    include_data = False,
+    visibility = ["//visibility:public"],
+    deps = [":safegoapp"],
+)

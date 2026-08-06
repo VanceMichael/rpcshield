@@ -1,0 +1,67 @@
+# gazelle:gomock interfaces=FileSystem,Runner library=github.com/uber-research/rpcshield/go/common/utils extra_imports=go.uber.org/mock/gomock
+# keep
+load("@io_bazel_rules_go//extras:gomock.bzl", "gomock")
+load("@io_bazel_rules_go//go:def.bzl", "go_library", "go_test")
+
+go_library(
+    name = "go_default_library",
+    srcs = [
+        "filesystem.go",
+        "utils.go",
+    ],
+    importpath = "github.com/uber-research/rpcshield/go/common/utils",
+    visibility = ["//visibility:public"],
+    deps = [
+        "//constant:go_default_library",
+        "@org_golang_x_tools//go/ssa:go_default_library",
+    ],
+)
+
+go_test(
+    name = "go_default_test",
+    srcs = [
+        "filesystem_test.go",
+        "utils_test.go",
+    ],
+    embed = [":go_default_library"],
+    deps = [
+        ":go_utils_gomock_library",
+        "//constant:go_default_library",
+        "@com_github_stretchr_testify//assert:go_default_library",
+        "@com_github_stretchr_testify//require:go_default_library",
+        "@org_golang_x_tools//go/packages:go_default_library",
+        "@org_golang_x_tools//go/ssa:go_default_library",
+        "@org_uber_go_mock//gomock:go_default_library",
+    ],
+)
+
+gomock(
+    name = "filesystem_gomock",
+    out = "filesystem_mock.go",
+    mockgen_tool = "@org_uber_go_mock//mockgen",
+    package = "utilsmock",
+    self_package = "mock/github.com/uber-research/rpcshield/go/common/utils/utilsmock",
+    source = "filesystem.go",
+    source_importpath = "github.com/uber-research/rpcshield/go/common/utils",
+)
+
+gomock(
+    name = "runner_gomock",
+    out = "runner_mock.go",
+    mockgen_tool = "@org_uber_go_mock//mockgen",
+    package = "utilsmock",
+    self_package = "mock/github.com/uber-research/rpcshield/go/common/utils/utilsmock",
+    source = "utils.go",
+    source_importpath = "github.com/uber-research/rpcshield/go/common/utils",
+)
+
+go_library(
+    name = "go_utils_gomock_library",
+    srcs = [
+        "filesystem_mock.go",
+        "runner_mock.go",
+    ],
+    importpath = "mock/github.com/uber-research/rpcshield/go/common/utils/utilsmock",
+    visibility = ["//visibility:public"],
+    deps = ["@org_uber_go_mock//gomock:go_default_library"],
+)

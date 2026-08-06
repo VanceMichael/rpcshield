@@ -1,0 +1,31 @@
+# keep
+load("@io_bazel_rules_go//go:def.bzl", "go_library", "go_test")
+
+go_library(
+    name = "go_default_library",
+    srcs = [
+        "cdg.go",
+        "inverse_cdg.go",
+    ],
+    importpath = "github.com/uber-research/rpcshield/go/staticanalyzer/ssahelper/cdg",
+    visibility = ["//visibility:public"],
+    deps = ["@org_golang_x_tools//go/ssa:go_default_library"],
+)
+
+go_test(
+    name = "go_default_test",
+    size = "large",
+    srcs = [
+        "cdg_test.go",
+        "cfg_rewriter_test.go",
+        "charge_regression_test.go",
+        "inverse_cdg_test.go",
+    ],
+    data = glob(["testdata/**"]),
+    embed = [":go_default_library"],
+    deps = [
+        "@com_github_stretchr_testify//assert:go_default_library",
+        "@com_github_stretchr_testify//require:go_default_library",
+        "@org_golang_x_tools//go/ssa:go_default_library",
+    ],
+)

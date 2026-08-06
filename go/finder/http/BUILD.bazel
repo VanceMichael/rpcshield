@@ -1,0 +1,56 @@
+# keep
+load("@io_bazel_rules_go//go:def.bzl", "go_library", "go_test")
+
+go_library(
+    name = "go_default_library",
+    srcs = [
+        "endpoint_parser.go",
+        "gin.go",
+        "gorilla.go",
+        "handler_parser.go",
+        "inbound.go",
+        "mux.go",
+        "utils.go",
+    ],
+    importpath = "github.com/uber-research/rpcshield/go/finder/http",
+    visibility = ["//visibility:public"],
+    deps = [
+        "//common/syntheticfunc:go_default_library",
+        "//common/xslice:go_default_library",
+        "//finder/types:go_default_library",
+        "//grail:go_default_library",
+        "@org_golang_x_tools//go/packages:go_default_library",
+        "@org_golang_x_tools//go/ssa:go_default_library",
+        "@org_golang_x_tools//go/ssa/ssautil:go_default_library",
+        "@org_golang_x_tools//go/types/typeutil:go_default_library",
+        "@org_uber_go_zap//:go_default_library",
+    ],
+)
+
+go_test(
+    name = "go_default_test",
+    size = "large",
+    srcs = [
+        "gin_test.go",
+        "inbound_test.go",
+        "infra_coverage_test.go",
+    ],
+    data = [
+        "//exampleapps/ginhttp:ginhttp-anal",
+        "//exampleapps/gorillahttp:gorillahttp-anal",
+        "//exampleapps/muxinfra:muxinfra-anal",
+        "@go_sdk//:files",
+    ],
+    embed = [":go_default_library"],
+    deps = [
+        "//common/mapper:go_default_library",
+        "//finder/types:go_default_library",
+        "//grail:go_default_library",
+        "//loader:go_default_library",
+        "@com_github_stretchr_testify//assert:go_default_library",
+        "@com_github_stretchr_testify//require:go_default_library",
+        "@org_golang_x_tools//go/packages:go_default_library",
+        "@org_golang_x_tools//go/ssa:go_default_library",
+        "@org_uber_go_zap//:go_default_library",
+    ],
+)

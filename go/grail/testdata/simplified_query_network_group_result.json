@@ -1,0 +1,74 @@
+{
+  "total": 11965,
+  "cost": 250801,
+  "instance": {
+    "zone": "zone1",
+    "region": "region1",
+    "host": "host1",
+    "frontend": "compute",
+    "environment": "production"
+  },
+  "result": [
+    {
+      "group": "swn::trafficgroup:grail-test-svc-008",
+      "service_names": [
+        "grail-test-svc-014"
+      ]
+    },
+    {
+      "service_names": [
+        "grail-test-svc-016"
+      ],
+      "group": "swn::trafficgroup:grail-test-svc-016"
+    },
+    {
+      "group": "swn::trafficgroup:grail-test-svc-001",
+      "service_names": [
+        "grail-test-svc-003"
+      ]
+    },
+    {
+      "group": "swn::trafficgroup:grail-test-svc-023",
+      "service_names": [
+        "grail-test-svc-023"
+      ]
+    },
+    {
+      "group": "swn::trafficgroup:grail-test-svc-031",
+      "service_names": [
+        "grail-test-svc-031"
+      ]
+    },
+    {
+      "group": "swn::trafficgroup:grail-test-svc-027",
+      "service_names": [
+        "grail-test-svc-030"
+      ]
+    },
+    {
+      "service_names": [
+        "grail-test-svc-017"
+      ],
+      "group": "swn::trafficgroup:grail-test-svc-007"
+    },
+    {
+      "group": "swn::discoverygroup:grail-test-svc-002",
+      "service_names": [
+        "grail-test-svc-009"
+      ]
+    },
+    {
+      "group": "swn::trafficgroup:grail-test-svc-024",
+      "service_names": [
+        "grail-test-svc-024"
+      ]
+    },
+    {
+      "group": "swn::trafficgroup:grail-test-svc-006",
+      "service_names": [
+        "grail-test-svc-006"
+      ]
+    }
+  ],
+  "count": 11965
+}

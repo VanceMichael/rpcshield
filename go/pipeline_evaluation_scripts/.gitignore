@@ -1,0 +1,3 @@
+# Cloned OSS repos (populated by clone_datasets.sh); large, third-party, and reproducible from
+# targets.csv -- never commit.
+/datasets/

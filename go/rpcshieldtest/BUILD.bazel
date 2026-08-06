@@ -1,0 +1,21 @@
+# keep
+load("@io_bazel_rules_go//go:def.bzl", "go_library")
+
+go_library(
+    name = "go_default_library",
+    testonly = True,
+    srcs = ["testhelper.go"],
+    data = ["//exampleapps/rpcshielddemo:rpcshielddemo-anal"],
+    importpath = "github.com/uber-research/rpcshield/go/rpcshieldtest",
+    visibility = ["//visibility:public"],
+    deps = [
+        "//common/pkgdeps:go_default_library",
+        "//loader:go_default_library",
+        "//staticanalyzer/anonymousfunc:go_default_library",
+        "//staticanalyzer/asthelper:go_default_library",
+        "@com_github_stretchr_testify//require:go_default_library",
+        "@org_golang_x_tools//go/packages:go_default_library",
+        "@org_golang_x_tools//go/ssa:go_default_library",
+        "@org_golang_x_tools//go/ssa/ssautil:go_default_library",
+    ],
+)

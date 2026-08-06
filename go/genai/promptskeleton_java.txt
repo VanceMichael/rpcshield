@@ -1,0 +1,109 @@
+We define a `Caller()-Callee()` pair to be fail-close, if a failure in Callee() is bubbled out of the Caller(). A failure can be an exception thrown by Callee() that is either uncaught or re-thrown in the Caller().
+
+The example-1 below show a simple case of fail-close Caller-Callee pair.
+
+```
+public Response call(Request r) throws Exception {
+    // ... some unrelated code
+    Response resp;
+    try {
+        resp = Callee.call(...); // We want to know if this call is fail-close.
+    } catch (Exception e) {
+        throw e; // This bubble-up of exception makes Caller-Callee pair fail-close.
+    }
+    // ... some unrelated code
+    Response c = AnotherUnrelatedCall.call(...);
+    // ... some unrelated code
+    return new Response(a + resp + c);
+}
+```
+
+The example-2 below show a complicated case of fail-close Caller-Callee relationship, where the failure results from the value produced from `Callee()`.
+
+```
+public Response call(Request r) throws Exception {
+    // ... some unrelated code
+    Response resp;
+    try {
+        resp = Callee.call(...); // We want to know if this call is fail-close.
+    } catch (Exception e) {
+        log.error("Callee returned error", e); // This is not fail-close because the exception is caught and not re-thrown, meaning the failure is not propagated.
+    }
+    // ... some unrelated code
+    Response resp1 = someFuncCall(resp); // resp1 is derived from resp.
+    // ... some unrelated code
+    Response c;
+    try {
+        c = AnotherCallee.call(resp1); // resp1 derived from resp can make AnotherCallee() to return non-nil error
+    } catch (Exception e) {
+        throw e; // resp1 derived from resp derived from Callee() can make AnotherCallee to fail making Caller-Callee pair fail-close.
+    }
+    // ... some code
+    return new Response(a + resp + c);
+}
+```
+
+If a `Caller()-Callee()` pair is not fail-close, it is fail-open.
+Example-3 below shows that `Caller()-Callee()` pair is fail-open.
+
+```
+public Response call(Request r) throws Exception {
+    // ... some unrelated code
+    Response resp1;
+    try {
+        resp1 = Callee.call(...); // Instance-1
+    } catch (Exception e) {
+        log.error("log error", e); // only logs but does not throw exception. Hence Caller-Callee instance-1 is fail-open.
+    }
+
+    Response resp2;
+    try {
+        resp2 = Callee.call(...); // Instance-2
+    } catch (Exception e) {
+        return null; // Caller-Callee() instance-2 is also fail-open since we return null here.
+    }
+
+    // ... some unrelated code
+    Response c;
+    try {
+        c = AnotherUnrelatedCall.call(...);
+    } catch (Exception e) {
+        return null; // This non-nil error is unrelated to Caller-Callee pair
+    }
+    // ... some code
+    return new Response(a + resp1 + resp2 + c);
+}
+```
+
+The example-4 below shows a simple case of fail-close Caller-Callee pair which uses CompletableFuture .
+
+```
+public CompletableFuture<Response> call(Request r) throws Exception {
+    // ... some unrelated code
+     CompletableFuture<Response> future = new CompletableFuture<>();
+    try {
+        future.complete(Callee.call(...)); // We want to know if this call is fail-close.
+    } catch (Exception e) {
+        future.completeExceptionally(e); // This use of completeExceptionally callback to bubble-up up exception using CompletableFuture makes makes Caller-Callee pair fail-close.
+    }
+    return future;
+}
+```
+
+The example-5 below shows a simple case of fail-open Caller-Callee pair which uses CompletableFuture .
+
+```
+public CompletableFuture<Response> call(Request r) throws Exception {
+    // ... some unrelated code
+     CompletableFuture<Response> future = new CompletableFuture<>();
+    try {
+        future.complete(Callee.call(...)); // We want to know if this call is fail-close.
+    } catch (Exception e) {
+        future.complete(processError(e)); // This conversion of exception to an alternate response and using complete callback of CompletableFuture makes Caller-Callee pair fail-open.
+    }
+    return future;
+}
+```
+
+Pay attention to these additional coding idioms:
+1. In addition, if a non-null exception is thrown via a customized error wrapper exception, such as "throw new AnotherException(e)", "throw new RuntimeException(e)", etc., assume that the exception throw continues to remain fail-close.

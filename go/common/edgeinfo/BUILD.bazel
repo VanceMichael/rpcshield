@@ -1,0 +1,10 @@
+load("@io_bazel_rules_go//go:def.bzl", "go_library")
+
+# keep
+go_library(
+    name = "go_default_library",
+    srcs = ["edgeinfo.go"],
+    importpath = "github.com/uber-research/rpcshield/go/common/edgeinfo",
+    visibility = ["//visibility:public"],
+    deps = ["@org_golang_x_tools//go/callgraph:go_default_library"],
+)

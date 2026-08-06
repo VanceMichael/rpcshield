@@ -1,0 +1,32 @@
+# keep
+load("@io_bazel_rules_go//go:def.bzl", "go_library", "go_test")
+
+go_library(
+    name = "go_default_library",
+    srcs = ["unwrapper.go"],
+    importpath = "github.com/uber-research/rpcshield/go/common/syntheticfunc",
+    visibility = ["//visibility:public"],
+    deps = [
+        "@org_golang_x_tools//go/callgraph:go_default_library",
+        "@org_golang_x_tools//go/ssa:go_default_library",
+        "@org_uber_go_zap//:go_default_library",
+    ],
+)
+
+go_test(
+    name = "go_default_test",
+    srcs = ["unwrapper_test.go"],
+    data = [
+        "//exampleapps/syntheticcallee:syntheticcallee-anal",
+        "@go_sdk//:files",
+    ],
+    embed = [":go_default_library"],
+    deps = [
+        "//loader:go_default_library",
+        "@com_github_stretchr_testify//require:go_default_library",
+        "@org_golang_x_tools//go/callgraph/rta:go_default_library",
+        "@org_golang_x_tools//go/ssa:go_default_library",
+        "@org_golang_x_tools//go/ssa/ssautil:go_default_library",
+        "@org_uber_go_zap//:go_default_library",
+    ],
+)

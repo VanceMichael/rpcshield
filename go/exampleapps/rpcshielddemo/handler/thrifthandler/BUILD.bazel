@@ -1,0 +1,17 @@
+load("@io_bazel_rules_go//go:def.bzl", "go_library")
+
+# gazelle:resolve go thriftrw/simpleservice //exampleapps/rpcshielddemo/genthrift/simpleservice:go_default_library
+# gazelle:resolve go thriftrw/simpleservice/simpleserviceclient //exampleapps/rpcshielddemo/genthrift/simpleservice/simpleserviceclient:go_default_library
+# gazelle:resolve go thriftrw/simpleservice/simpleserviceserver //exampleapps/rpcshielddemo/genthrift/simpleservice/simpleserviceserver:go_default_library
+go_library(
+    name = "go_default_library",
+    srcs = ["thrifthandler.go"],
+    importpath = "github.com/uber-research/rpcshield/go/exampleapps/rpcshielddemo/handler/thrifthandler",
+    visibility = ["//visibility:public"],
+    deps = [
+        "//exampleapps/rpcshielddemo/controller:go_default_library",
+        "//exampleapps/rpcshielddemo/genthrift/simpleservice:go_default_library",
+        "//exampleapps/rpcshielddemo/genthrift/simpleservice/simpleserviceclient:go_default_library",
+        "//exampleapps/rpcshielddemo/genthrift/simpleservice/simpleserviceserver:go_default_library",
+    ],
+)

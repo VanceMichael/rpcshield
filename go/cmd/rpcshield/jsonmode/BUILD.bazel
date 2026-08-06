@@ -1,0 +1,22 @@
+load("@io_bazel_rules_go//go:def.bzl", "go_library")
+
+# keep
+go_library(
+    name = "go_default_library",
+    srcs = [
+        "annotateresult.go",
+        "jsonhandler.go",
+        "jsonmode.go",
+    ],
+    importpath = "github.com/uber-research/rpcshield/go/cmd/rpcshield/jsonmode",
+    visibility = ["//visibility:public"],
+    deps = [
+        "//callnode:go_default_library",
+        "//cmd/rpcshield/common:go_default_library",
+        "//genai:go_default_library",
+        "//output:go_default_library",
+        "@in_gopkg_yaml_v3//:go_default_library",
+        "@org_uber_go_zap//:go_default_library",
+        "@org_uber_go_zap//zapcore:go_default_library",
+    ],
+)

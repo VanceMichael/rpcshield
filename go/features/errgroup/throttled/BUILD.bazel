@@ -1,0 +1,13 @@
+# importpath is OSS-native (matches this module's Go path); this is purely a test fixture for
+# graph/errgroupenricher_test.go's structural (method-shape) detection, which does not depend on
+# the import path at all. See features/safego/BUILD.bazel for the one feature where the import
+# path is actually load-bearing, and how a real monorepo integration would customize it.
+load("@io_bazel_rules_go//go:def.bzl", "go_library")
+
+go_library(
+    name = "go_default_library",
+    srcs = ["control_flow.go"],
+    importpath = "github.com/uber-research/rpcshield/go/features/errgroup/throttled",
+    visibility = ["//visibility:public"],
+    deps = ["@org_golang_x_sync//errgroup:go_default_library"],
+)

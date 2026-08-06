@@ -1,0 +1,52 @@
+# keep
+load("@io_bazel_rules_go//go:def.bzl", "go_library", "go_test")
+
+go_library(
+    name = "go_default_library",
+    srcs = [
+        "finder.go",
+        "inbound.go",
+        "outbound.go",
+    ],
+    importpath = "github.com/uber-research/rpcshield/go/finder",
+    visibility = ["//visibility:public"],
+    deps = [
+        "//common/utils:go_default_library",
+        "//constant:go_default_library",
+        "//finder/http:go_default_library",
+        "//finder/servicemapping:go_default_library",
+        "//finder/types:go_default_library",
+        "//grail:go_default_library",
+        "//staticanalyzer/asthelper:go_default_library",
+        "@org_golang_x_tools//go/packages:go_default_library",
+        "@org_golang_x_tools//go/ssa:go_default_library",
+        "@org_golang_x_tools//go/types/typeutil:go_default_library",
+        "@org_uber_go_zap//:go_default_library",
+    ],
+)
+
+go_test(
+    name = "go_default_test",
+    srcs = [
+        "inbound_test.go",
+        "outbound_test.go",
+    ],
+    data = [
+        "//exampleapps/outbounds/cadence:cadence-anal",
+        "//exampleapps/outbounds/genericgrpcthrift:genericgrpcthrift-anal",
+        "//exampleapps/rpcshielddemo:rpcshielddemo-anal",
+        "@go_sdk//:files",
+    ],
+    embed = [":go_default_library"],
+    deps = [
+        "//finder/servicemapping:go_default_library",
+        "//finder/types:go_default_library",
+        "//grail:go_default_library",
+        "//loader:go_default_library",
+        "//rpcshieldtest:go_default_library",
+        "@com_github_stretchr_testify//require:go_default_library",
+        "@org_golang_x_tools//go/packages:go_default_library",
+        "@org_golang_x_tools//go/ssa:go_default_library",
+        "@org_golang_x_tools//go/ssa/ssautil:go_default_library",
+    ],
+)

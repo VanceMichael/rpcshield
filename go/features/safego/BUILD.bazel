@@ -1,0 +1,16 @@
+# importpath is OSS-native (matches this module's Go path) and is the enricher's default --
+# see graph.DefaultSafeGoPkgPath / graph.Config.SafeGoPkgPath. A company-internal fork wanting
+# this fork to be a drop-in replacement for its own real internal safego-equivalent package (so
+# existing call sites don't need their imports changed) should add a one-line wrapper package in
+# ITS OWN repo, under its real internal import path, that forwards to this package's Go function,
+# and set config.Config.SafeGoPkgPath to that real import path so the enricher still recognizes
+# the (now-wrapped) call sites -- see graph.Config.SafeGoPkgPath's doc comment.
+# keep
+load("@io_bazel_rules_go//go:def.bzl", "go_library")
+
+go_library(
+    name = "go_default_library",
+    srcs = ["go.go"],
+    importpath = "github.com/uber-research/rpcshield/go/features/safego",
+    visibility = ["//visibility:public"],
+)

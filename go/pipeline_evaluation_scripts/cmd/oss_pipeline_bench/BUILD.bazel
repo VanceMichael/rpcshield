@@ -1,0 +1,26 @@
+load("@io_bazel_rules_go//go:def.bzl", "go_binary", "go_library")
+
+go_library(
+    name = "go_default_library",
+    srcs = ["main.go"],
+    importpath = "github.com/uber-research/rpcshield/go/pipeline_evaluation_scripts/cmd/oss_pipeline_bench",
+    visibility = ["//visibility:private"],
+    deps = [
+        "//:go_default_library",
+        "//common/utils:go_default_library",
+        "//config:go_default_library",
+        "//constant:go_default_library",
+        "//finder/servicemapping:go_default_library",
+        "//grail:go_default_library",
+        "//graph:go_default_library",
+        "@org_golang_x_tools//go/packages:go_default_library",
+        "@org_uber_go_zap//:go_default_library",
+        "@org_uber_go_zap//zapcore:go_default_library",
+    ],
+)
+
+go_binary(
+    name = "oss_pipeline_bench",
+    embed = [":go_default_library"],
+    visibility = ["//visibility:public"],
+)

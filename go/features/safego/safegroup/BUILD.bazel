@@ -1,0 +1,13 @@
+# importpath is OSS-native (matches this module's Go path); this package is picked up by
+# rpcshield's errgroup enricher structurally, so (unlike ../BUILD.bazel's go.go shim) the import
+# path here is not load-bearing.
+# keep
+load("@io_bazel_rules_go//go:def.bzl", "go_library")
+
+go_library(
+    name = "go_default_library",
+    srcs = ["group.go"],
+    importpath = "github.com/uber-research/rpcshield/go/features/safego/safegroup",
+    visibility = ["//visibility:public"],
+    deps = ["@org_golang_x_sync//errgroup:go_default_library"],
+)

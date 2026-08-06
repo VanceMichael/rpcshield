@@ -1,0 +1,41 @@
+load("@io_bazel_rules_go//go:def.bzl", "go_binary", "go_library", "go_path")
+
+# gazelle:resolve go gogoproto/rpcshielddemo //exampleapps/rpcshielddemo/genproto/rpcshielddemo:go_default_library
+go_library(
+    name = "go_default_library",
+    srcs = ["main.go"],
+    importpath = "github.com/uber-research/rpcshield/go/exampleapps/rpcshielddemo",
+    visibility = ["//visibility:private"],
+    deps = [
+        "//exampleapps/rpcshielddemo/controller:go_default_library",
+        "//exampleapps/rpcshielddemo/gateway/httpservicefoo:go_default_library",
+        "//exampleapps/rpcshielddemo/gateway/lottery:go_default_library",
+        "//exampleapps/rpcshielddemo/genproto/rpcshielddemo:go_default_library",
+        "//exampleapps/rpcshielddemo/handler:go_default_library",
+        "//exampleapps/rpcshielddemo/util/httpclient:go_default_library",
+    ],
+)
+
+go_binary(
+    name = "rpcshielddemo",
+    embed = [":go_default_library"],
+    visibility = ["//visibility:public"],
+)
+
+# rta/rtatest and driver/finder/graph tests use this as their whole-program SSA fixture, the same
+# way exampleapps/simplefx1's "simplefx1-anal" go_path feeds modelfx's tests -- go_path
+# materializes the entire dependency closure (including the nested gogoproto/thriftrw modules) as
+# a real GOPATH tree, so loader.LoadWithGoPath can load it hermetically under `bazel test` with no
+# live module resolution. handler/thrifthandler is listed explicitly (not just ":rpcshielddemo")
+# because nothing in main's dependency closure imports it -- it's a second, unwired inbound
+# transport used only for finder's structural-classification tests.
+go_path(
+    name = "rpcshielddemo-anal",
+    testonly = True,
+    include_data = False,
+    visibility = ["//visibility:public"],
+    deps = [
+        ":rpcshielddemo",
+        "//exampleapps/rpcshielddemo/handler/thrifthandler:go_default_library",
+    ],
+)

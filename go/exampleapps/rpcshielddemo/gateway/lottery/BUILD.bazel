@@ -1,0 +1,14 @@
+load("@io_bazel_rules_go//go:def.bzl", "go_library")
+
+# gazelle:resolve go thriftrw/lottery //exampleapps/rpcshielddemo/genthrift/lottery:go_default_library
+# gazelle:resolve go thriftrw/lottery/lotteryclient //exampleapps/rpcshielddemo/genthrift/lottery/lotteryclient:go_default_library
+go_library(
+    name = "go_default_library",
+    srcs = ["lottery.go"],
+    importpath = "github.com/uber-research/rpcshield/go/exampleapps/rpcshielddemo/gateway/lottery",
+    visibility = ["//visibility:public"],
+    deps = [
+        "//exampleapps/rpcshielddemo/genthrift/lottery:go_default_library",
+        "//exampleapps/rpcshielddemo/genthrift/lottery/lotteryclient:go_default_library",
+    ],
+)

@@ -1,0 +1,98 @@
+load("@bazel_gazelle//:def.bzl", "gazelle")
+load("@io_bazel_rules_go//go:def.bzl", "go_library", "go_test")
+
+# gazelle:prefix github.com/uber-research/rpcshield/go
+# gazelle:go_naming_convention go_default_library
+# gazelle:exclude **/testdata
+gazelle(name = "gazelle")
+
+filegroup(
+    name = "testdata",
+    srcs = glob(["testdata/**"]),
+    visibility = ["//visibility:public"],
+)
+
+# keep
+go_library(
+    name = "go_default_library",
+    srcs = [
+        "driver.go",
+        "rtabench.go",
+        "target_resolver.go",
+    ],
+    embedsrcs = [
+        "missingsvg.txt",
+    ],
+    importpath = "github.com/uber-research/rpcshield/go",
+    visibility = ["//visibility:public"],
+    deps = [
+        "//bazel:go_default_library",
+        "//common/edgeinfo:go_default_library",
+        "//common/mapper:go_default_library",
+        "//common/pkgdeps:go_default_library",
+        "//common/utils:go_default_library",
+        "//config:go_default_library",
+        "//constant:go_default_library",
+        "//finder:go_default_library",
+        "//finder/servicemapping:go_default_library",
+        "//finder/types:go_default_library",
+        "//genai:go_default_library",
+        "//grail:go_default_library",
+        "//graph:go_default_library",
+        "//input:go_default_library",
+        "//loader:go_default_library",
+        "//output:go_default_library",
+        "//query:go_default_library",
+        "//reporting:go_default_library",
+        "//staticanalyzer/asthelper:go_default_library",
+        "//staticanalyzer/cacheanalyzer:go_default_library",
+        "//staticanalyzer/function:go_default_library",
+        "//staticanalyzer/predefined:go_default_library",
+        "//staticanalyzer/ssaanal:go_default_library",
+        "@com_github_google_uuid//:go_default_library",
+        "@in_gopkg_yaml_v3//:go_default_library",
+        "@org_golang_x_tools//go/callgraph:go_default_library",
+        "@org_golang_x_tools//go/packages:go_default_library",
+        "@org_golang_x_tools//go/ssa:go_default_library",
+        "@org_golang_x_tools//go/ssa/ssautil:go_default_library",
+        "@org_uber_go_zap//:go_default_library",
+    ],
+)
+
+go_test(
+    name = "go_default_test",
+    srcs = [
+        "driver_test.go",
+        "rtabench_test.go",
+    ],
+    data = [
+        "//exampleapps/rpcshielddemo:rpcshielddemo-anal",
+        "@go_sdk//:files",
+    ],
+    embed = [":go_default_library"],
+    deps = [
+        "//bazel:go_bazel_gomock_library",
+        "//common/edgeinfo:go_default_library",
+        "//common/mapper:go_default_library",
+        "//common/pkgdeps:go_default_library",
+        "//common/utils:go_utils_gomock_library",
+        "//constant:go_default_library",
+        "//finder:go_default_library",
+        "//finder/servicemapping:go_default_library",
+        "//finder/types:go_default_library",
+        "//genai:go_genai_gomock_library",
+        "//grail:go_default_library",
+        "//graph:go_default_library",
+        "//output:go_default_library",
+        "//rpcshieldtest:go_default_library",
+        "//rta/rtatest:go_default_library",
+        "//staticanalyzer/asthelper:go_default_library",
+        "@com_github_sashabaranov_go_openai//:go_default_library",
+        "@com_github_stretchr_testify//assert:go_default_library",
+        "@com_github_stretchr_testify//require:go_default_library",
+        "@org_golang_x_tools//go/packages:go_default_library",
+        "@org_golang_x_tools//go/ssa:go_default_library",
+        "@org_uber_go_mock//gomock:go_default_library",
+        "@org_uber_go_zap//:go_default_library",
+    ],
+)

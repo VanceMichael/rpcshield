@@ -1,0 +1,17 @@
+load("@io_bazel_rules_go//go:def.bzl", "go_library")
+
+# keep
+go_library(
+    name = "go_default_library",
+    srcs = ["server.go"],
+    importpath = "thriftrw/lottery/lotteryserver",
+    visibility = ["//visibility:public"],
+    deps = [
+        "//exampleapps/rpcshielddemo/genthrift/lottery:go_default_library",
+        "@org_uber_go_thriftrw//protocol/stream:go_default_library",
+        "@org_uber_go_thriftrw//wire:go_default_library",
+        "@org_uber_go_yarpc//api/transport:go_default_library",
+        "@org_uber_go_yarpc//encoding/thrift:go_default_library",
+        "@org_uber_go_yarpc//yarpcerrors:go_default_library",
+    ],
+)

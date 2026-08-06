@@ -1,0 +1,74 @@
+{
+    "Inbound": {
+        "Service": {
+            "name": "cff-demo",
+            "tier": -1,
+            "git_uri": ""
+        },
+        "APIName": "uber.infra.progsys.cffdemo.cffdemo__create"
+    },
+    "Outbound": {
+        "Service": {
+            "name": "lottery",
+            "tier": 5,
+            "git_uri": "gitolite@example.internal:go-code"
+        },
+        "APIName": "lottery__play"
+    },
+    "PathResults": [
+        {
+            "Edges": [
+                {
+                    "Caller": "(*example.internal/infra/progsys/cff-demo/gateway/lottery.gateway).Play",
+                    "Callee": "(thriftrw/example.internal/infra/lottery/lottery/lotteryclient.Interface).Play",
+                    "Filepath": "src/example.internal/infra/progsys/cff-demo/gateway/lottery/lottery.go",
+                    "SourceGraphLink": "https://sourcegraph.example.com/example.internal/uber-code/go-code@3e33f70c7a53ee34386476ec9a81474a834ad634/-/blob/src/example.internal/infra/progsys/cff-demo/gateway/lottery/lottery.go?L34",
+                    "AnalyzerOutput": {
+                        "Status": "FailClose",
+                        "DiagnosticMsg": "",
+                        "Source": "SSA"
+                    },
+                    "Error": null
+                },
+                {
+                    "Caller": "(*example.internal/infra/progsys/cff-demo/controller/cff-demo.controller).Create$2",
+                    "Callee": "(example.internal/infra/progsys/cff-demo/gateway/lottery.Gateway).Play",
+                    "Filepath": "src/example.internal/infra/progsys/cff-demo/controller/cff-demo/cff_demo_cffgen.go",
+                    "SourceGraphLink": "https://sourcegraph.example.com/example.internal/uber-code/go-code@3e33f70c7a53ee34386476ec9a81474a834ad634/-/blob/src/example.internal/infra/progsys/cff-demo/controller/cff-demo/cff_demo_cffgen.go?L52",
+                    "AnalyzerOutput": {
+                        "Status": "FailClose",
+                        "DiagnosticMsg": "",
+                        "Source": "SSA"
+                    },
+                    "Error": null
+                },
+                {
+                    "Caller": "(*example.internal/infra/progsys/cff-demo/controller/cff-demo.controller).Create",
+                    "Callee": "example.internal/infra/progsys/cff-demo/controller/cff-demo._cffFlowcffdemo_43_9",
+                    "Filepath": "src/example.internal/infra/progsys/cff-demo/controller/cff-demo/cff_demo_cffgen.go",
+                    "SourceGraphLink": "https://sourcegraph.example.com/example.internal/uber-code/go-code@3e33f70c7a53ee34386476ec9a81474a834ad634/-/blob/src/example.internal/infra/progsys/cff-demo/controller/cff-demo/cff_demo_cffgen.go?L43",
+                    "AnalyzerOutput": {
+                        "Status": "FailClose",
+                        "DiagnosticMsg": "",
+                        "Source": "SSA"
+                    },
+                    "Error": null
+                },
+                {
+                    "Caller": "(*example.internal/infra/progsys/cff-demo/handler/cff-demo.handler).Create",
+                    "Callee": "(example.internal/infra/progsys/cff-demo/controller/cff-demo.Controller).Create",
+                    "Filepath": "src/example.internal/infra/progsys/cff-demo/handler/cff-demo/cff_demo.go",
+                    "SourceGraphLink": "https://sourcegraph.example.com/example.internal/uber-code/go-code@3e33f70c7a53ee34386476ec9a81474a834ad634/-/blob/src/example.internal/infra/progsys/cff-demo/handler/cff-demo/cff_demo.go?L28",
+                    "AnalyzerOutput": {
+                        "Status": "FailClose",
+                        "DiagnosticMsg": "Fail close since at least one path is found in the function that returns an error influenced by the callsite",
+                        "Source": "AST"
+                    },
+                    "Error": null
+                }
+            ],
+            "Status": "FailClose"
+        }
+    ],
+    "Status": "FailClose"
+}

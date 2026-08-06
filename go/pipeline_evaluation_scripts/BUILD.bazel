@@ -1,0 +1,2 @@
+# gazelle:exclude datasets/**
+# gazelle:exclude fixtures/**

@@ -1,0 +1,254 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>RPCShield Report</title>
+<script src="https://cdn.jsdelivr.net/npm/svg-pan-zoom/dist/svg-pan-zoom.min.js"></script>
+<style>
+    body, html {
+        height: 100%;
+        margin: 0;
+        font-family: Arial, sans-serif;
+    }
+    table {
+        width: 100%;
+        border-collapse: collapse;
+        max-width: fit-content;
+        overflow-wrap: anywhere;
+    }
+    td {
+        overflow-wrap: anywhere;
+    }
+    #container {
+        display: flex;
+        height: 100%;
+    }
+    #svgContainer {
+        flex: 1;
+        background: #f4f4f4;
+        padding: 20px;
+        display: flex;
+        flex-direction: column;
+        overflow: auto;
+    }
+    .svgContent {
+        flex: 1;
+        display: none;
+        align-items: flex-start;
+        justify-content: center;
+        overflow: auto;
+    }
+    #svgContentDisplay {
+        padding-top: 10px;
+    }
+    #paginationControls {
+        text-align: left;
+        margin-bottom: 10px;
+    }
+    #helpControls {
+        text-align: right;
+        margin-bottom: 10px;
+    }
+    #textContainer {
+        flex: 1;
+        background: #f4f4f4;
+        padding: 20px;
+        display: flex;
+        flex-direction: column;
+        overflow-y: auto;
+    }
+    #svgContentDisplay svg {
+        display: block;
+        max-width: 100%;
+        max-height: 100%;
+        overflow: visible;
+    }
+    #explanationText {
+        width: 100%;
+        height: 100%;
+        display: block;
+        overflow: visible;
+        padding: 10px;
+    }
+    .heading {
+        justify-content: center;
+        text-align: center;
+    }
+    .resultEdge {
+        cursor: pointer;
+    }
+    button {
+        cursor: pointer;
+    }
+    .label {
+        font-weight: bold;
+    }
+    #helpContent {
+      display: none;
+    }
+    .grid-container {
+        display: grid;
+        grid-template-columns: repeat(3, 1fr);
+        grid-gap: 10px;
+        color: dimgray;
+    }
+    .grid-item {
+        display: flex;
+        flex-direction: column;
+        align-items: center;
+        text-align: center;
+    }
+    .helpContentStyle {
+      border: 2px solid lightgray;
+      padding: 10px;
+      margin-bottom: 20px;
+    }
+</style>
+</head>
+<body>
+<h1 class="heading">RPCShield Report</h1>
+<div id="container">
+    <div id="svgContainer">
+        <div id="paginationControls">
+            Sections:
+            <button id="prevPage" onclick="prevPage()">Previous</button>
+            <span id="pageNumber">1</span> of <span id="totalPages">1</span>
+            <button id="nextPage" onclick="nextPage()">Next</button>
+        </div>
+        <div id="svgContentDisplay">
+        </div>
+        {{range .SVGs}}<div class="svgContent">{{ . }}</div>{{end}}
+    </div>
+    <div id="textContainer">
+      <div id="helpControls">
+          <button id="help" onclick="showHelp()">Help?</button>
+      </div>
+      <div id="helpContent">
+        <h3 style="margin-top: 0px;">Help reading this report</h3>
+        <div class="helpContentStyle">
+          <span style="font-weight: bold; color: dimgray;">How to read the arrows in the tree?</span>
+          <br><br>
+          <div class="grid-container">
+            <div class="grid-item">
+              {{.ArrowCall}}
+              <div style="padding-top: 15px;">
+                <span style="color: gray;"><span style="font-weight: bold;">Gray arrow:</span> Call relation</span>
+                <br>
+                "caller()" calls "callee()"
+              </div>
+            </div>
+            <div class="grid-item">
+              {{.ArrowFailClose}}
+              <div style="padding-top: 15px;">
+                <span style="color: red;"><span style="font-weight: bold;">Red arrow:</span> Fail-close</span>
+                <br>
+                "caller()" propagates "callee()" error
+              </div>
+            </div>
+            <div class="grid-item">
+              {{.ArrowFailOpen}}
+              <div style="padding-top: 15px;">
+                <span style="color: green;"><span style="font-weight: bold">Green arrow:</span> Fail-open</span>
+                <br>
+                "caller()" ignores "callee()" error
+              </div>
+            </div>
+          </div>
+        </div>
+        <div class="helpContentStyle">
+          <span style="font-weight: bold; color: dimgray;">How to interact with the tree?</span>
+          <br>
+          <ul>
+            <li>Click on <span style="color: red; font-weight: bold">red</span> or <span style="color: green; font-weight: bold">green</span> arrows to read explanation of fail-close or fail-open status.</li>
+            <li>Scroll to zoom, drag to pan, and click "Reset" to restore the original view.</li>
+            <li>Hover over a node to read the function's name, filepath, and start line.</li>
+            <li>Hover over red or green arrows to know the caller, callee, and status at a glance.</li>
+            <li>Navigate different sections using the 'Previous' and 'Next' buttons at top left.</li>
+          </ul>
+        </div>
+      </div>
+      <div id="explanationText">
+          <!-- This is where the explanation will appear -->
+      </div>
+    </div>
+</div>
+
+<script>
+let currentPage = 0;
+let pages = document.querySelectorAll('.svgContent');
+
+function showPage(page) {
+    if (page >= 0 && page < pages.length) {
+        const svgContentDisplay = document.getElementById('svgContentDisplay');
+
+        // Remove the old SVG and clear pan-zoom controls if necessary
+        if (svgContentDisplay.querySelector('svg')) {
+            let oldSvgPanZoomInstance = svgPanZoom(svgContentDisplay.querySelector('svg'));
+            if (oldSvgPanZoomInstance) {
+                oldSvgPanZoomInstance.destroy();
+            }
+        }
+
+        // Update the innerHTML with the new SVG content
+        svgContentDisplay.innerHTML = pages[page].innerHTML;
+
+        document.querySelectorAll('g.edge.resultEdge').forEach(node => {
+          node.addEventListener('click', function() {
+              const explanation = node.querySelector('explanation').textContent;
+              let formattedExplanation = explanation.replace(/\\n/g, '<br>'); // Replace newlines with HTML line breaks
+              formattedExplanation = formattedExplanation.replace(/\\t/g, '&nbsp;&nbsp;&nbsp;&nbsp;'); // Replace tabs with HTML spaces
+              document.getElementById('explanationText').innerHTML = formattedExplanation;
+          });
+        });
+
+        // Reinitialize svg-pan-zoom on the new SVG
+        if (svgContentDisplay.querySelector('svg')) {
+            svgPanZoom(svgContentDisplay.querySelector('svg'), {
+                zoomEnabled: true,
+                controlIconsEnabled: true,
+                fit: true,
+                center: false
+            });
+        }
+
+        document.getElementById('pageNumber').textContent = page + 1;
+        currentPage = page;
+
+        // Update button states
+        document.getElementById('prevPage').disabled = currentPage === 0;
+        document.getElementById('nextPage').disabled = currentPage === pages.length - 1;
+    }
+}
+
+function prevPage() {
+    if (currentPage > 0) {
+        document.getElementById('explanationText').innerHTML = "";
+        showPage(currentPage - 1);
+    }
+}
+
+function nextPage() {
+    if (currentPage < pages.length - 1) {
+        document.getElementById('explanationText').innerHTML = "";
+        showPage(currentPage + 1);
+    }
+}
+
+function showHelp() {
+  document.getElementById('explanationText').innerHTML = document.getElementById('helpContent').innerHTML;
+}
+
+document.addEventListener("DOMContentLoaded", function() {
+    document.getElementById('totalPages').textContent = pages.length;
+    showPage(currentPage); // Show the first page on load
+
+    document.getElementById('prevPage').disabled = currentPage === 0;
+    document.getElementById('nextPage').disabled = currentPage === pages.length - 1 || pages.length === 1;
+
+    showHelp() // Show help on load
+});
+</script>
+
+</body>
+</html>

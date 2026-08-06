@@ -1,0 +1,8 @@
+yarpc:
+  outbounds:
+    service-0046-alias:
+      # We intentionally use a different service for service-0046-alias. This should not cause
+      # any problems for our analysis since this config file should be simply ignored.
+      service: service-0047
+      tchannel:
+        with: muttley

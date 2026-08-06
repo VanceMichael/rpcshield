@@ -1,0 +1,11 @@
+uber::service:* (
+  EXCLUDE __id
+  # Remove "uber::service:" prefix from __id to form the service name.
+  FIELD substr(__id, 14, len(__id)) AS name
+  FIELD config::Config.tier AS tier
+  FIELD config::Config.git.uri AS git_uri
+  # If a service does not have a tier it is either inactive, stale, or simply invalid. In either
+  # case it is not interesting to our analysis.
+  WHERE tier != null
+  ORDER BY __id
+)

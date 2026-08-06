@@ -1,0 +1,38 @@
+# keep
+load("@io_bazel_rules_go//go:def.bzl", "go_library", "go_test")
+
+go_library(
+    name = "go_default_library",
+    srcs = [
+        "codebase.go",
+        "endpointtype.go",
+        "inbound.go",
+        "outbound.go",
+    ],
+    importpath = "github.com/uber-research/rpcshield/go/finder/types",
+    visibility = ["//visibility:public"],
+    deps = [
+        "//constant:go_default_library",
+        "//grail:go_default_library",
+        "@org_golang_x_tools//go/packages:go_default_library",
+        "@org_uber_go_zap//:go_default_library",
+    ],
+)
+
+go_test(
+    name = "go_default_test",
+    srcs = [
+        "codebase_test.go",
+        "inbound_test.go",
+        "outbound_test.go",
+    ],
+    data = ["@go_sdk//:files"],
+    embed = [":go_default_library"],
+    deps = [
+        "//grail:go_default_library",
+        "//rpcshieldtest:go_default_library",
+        "@com_github_stretchr_testify//require:go_default_library",
+        "@org_golang_x_tools//go/packages:go_default_library",
+        "@org_uber_go_zap//:go_default_library",
+    ],
+)

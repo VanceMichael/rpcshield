@@ -1,0 +1,30 @@
+load("@io_bazel_rules_go//go:def.bzl", "go_library")
+
+# keep
+go_library(
+    name = "go_default_library",
+    srcs = [
+        "set_memory_limit_linux.go",
+        "set_memory_limit_other.go",
+        "wpa.go",
+    ],
+    importpath = "github.com/uber-research/rpcshield/go/cmd/rpcshield/wpamode",
+    visibility = ["//visibility:public"],
+    deps = [
+        "//:go_default_library",
+        "//bazel:go_default_library",
+        "//cmd/rpcshield/common:go_default_library",
+        "//common/utils:go_default_library",
+        "//config:go_default_library",
+        "//constant:go_default_library",
+        "//finder/servicemapping:go_default_library",
+        "//genai:go_default_library",
+        "//grail:go_default_library",
+        "//query:go_default_library",
+        "//serviceregistry:go_default_library",
+        "//staticanalyzer/asthelper:go_default_library",
+        "@org_golang_x_tools//go/packages:go_default_library",
+        "@org_uber_go_zap//:go_default_library",
+        "@org_uber_go_zap//zapcore:go_default_library",
+    ],
+)

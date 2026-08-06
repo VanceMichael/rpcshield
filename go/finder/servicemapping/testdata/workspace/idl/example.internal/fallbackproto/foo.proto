@@ -1,0 +1,7 @@
+syntax = "proto3";
+
+package uber.fallbackproto;
+
+option go_package = "fallbackprotopb";
+option java_multiple_files = true;
+option java_package = "com.uber.fallbackproto";

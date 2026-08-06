@@ -1,0 +1,9 @@
+FunctionsChain:
+    - filepath: /src/cmdtests/example.internal/calculatefareshandler/handlerutil.go
+      funcName: handlerutil.ExecuteHandler
+      startLine: 32
+      endLine: 76
+    - filepath: /src/cmdtests/example.internal/calculatefareshandler/handler.go
+      funcName: calculatefareshandler.handlerImpl.CalculateEatsOrder
+      startLine: 131
+      endLine: 139

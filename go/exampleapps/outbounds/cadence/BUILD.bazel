@@ -1,0 +1,25 @@
+# keep
+load("@io_bazel_rules_go//go:def.bzl", "go_binary", "go_library", "go_path")
+
+go_library(
+    name = "go_default_library",
+    srcs = ["cadence.go"],
+    importpath = "github.com/uber-research/rpcshield/go/exampleapps/outbounds/cadence",
+    visibility = ["//visibility:public"],
+    deps = ["@org_uber_go_cadence//client:go_default_library"],
+)
+
+go_binary(
+    name = "cadence",
+    embed = [":go_default_library"],
+    visibility = ["//visibility:public"],
+)
+
+# finder/outbound_test.go (@rpcshield_ext) uses this example as test input.
+go_path(
+    name = "cadence-anal",
+    testonly = True,
+    include_data = False,
+    visibility = ["//visibility:public"],
+    deps = [":cadence"],
+)

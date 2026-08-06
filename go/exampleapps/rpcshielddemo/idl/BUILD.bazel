@@ -1,0 +1,20 @@
+# idl/*.proto and idl/*.thrift are source-of-truth IDL, checked in for provenance only --
+# they are NOT compiled by Bazel. The actual Go code consumed by the fixture is the
+# checked-in output of running the real OSS protoc-gen-yarpc-go / thriftrw-plugin-yarpc
+# compilers against these files (see ../genproto/rpcshielddemo/BUILD.bazel and
+# ../genthrift/*/BUILD.bazel), regenerated via:
+#
+#   protoc -I idl --gogoslick_out=genproto/rpcshielddemo --yarpc-go_out=genproto/rpcshielddemo \
+#       idl/rpcshielddemo.proto
+#   thriftrw --plugin yarpc --out genthrift --pkg-prefix thriftrw idl/lottery.thrift
+#   thriftrw --plugin yarpc --out genthrift --pkg-prefix thriftrw idl/simpleservice.thrift
+#
+# after `go install go.uber.org/thriftrw@latest`,
+# `go install go.uber.org/yarpc/encoding/thrift/thriftrw-plugin-yarpc@latest`, and
+# `go install go.uber.org/yarpc/encoding/protobuf/protoc-gen-yarpc-go@latest`.
+# keep
+filegroup(
+    name = "idl",
+    srcs = glob(["*.proto", "*.thrift"]),
+    visibility = ["//visibility:public"],
+)

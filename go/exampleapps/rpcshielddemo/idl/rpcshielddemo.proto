@@ -1,0 +1,28 @@
+syntax = "proto3";
+
+package rpcshielddemo;
+
+option go_package = "rpcshielddemo";
+
+message CreateRequest {
+    string name = 1;
+}
+
+message CreateResponse {
+    string uuid = 1;
+}
+
+message GetRequest {
+    string uuid = 1;
+}
+
+message GetResponse {
+    string name = 1;
+}
+
+service RpcshieldDemo {
+    // Create synchronously creates and saves a new RpcshieldDemo.
+    rpc Create(CreateRequest) returns (CreateResponse) {}
+    // Get synchronously retrieves a previously-created RpcshieldDemo.
+    rpc Get(GetRequest) returns (GetResponse) {}
+}

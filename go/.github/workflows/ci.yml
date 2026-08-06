@@ -1,0 +1,32 @@
+name: build-test
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+# WORKSPACE/.bazelrc/third_party/repos.bzl only use public sources (github.com, proxy.golang.org,
+# mirror.bazel.build) -- this is a small, self-contained Bazel workspace (unlike Uber's internal
+# go-code monorepo, which this repo was ported out of), so a real `bazel build //...`/
+# `bazel test //...` here is the intended full build, not an oversized/dangerous one.
+#
+# pipeline_evaluation_scripts/datasets/ (cloned OSS repos used by the sweep harness) is gitignored
+# and never present in a checkout, so it never enters `//...` here.
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Bazel
+        uses: bazel-contrib/setup-bazel@0.19.0
+        with:
+          bazelisk-cache: true
+          disk-cache: ${{ github.workflow }}
+          repository-cache: true
+
+      - name: bazel build //...
+        run: bazel build //...
+
+      - name: bazel test //...
+        run: bazel test //...

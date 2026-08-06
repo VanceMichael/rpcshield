@@ -1,0 +1,8 @@
+load("@io_bazel_rules_go//go:def.bzl", "go_library")
+
+go_library(
+    name = "go_default_library",
+    srcs = ["iface.go"],
+    importpath = "github.com/uber-research/rpcshield/go/exampleapps/errgroup/viainterface",
+    visibility = ["//visibility:public"],
+)

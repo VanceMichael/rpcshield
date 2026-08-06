@@ -1,0 +1,12 @@
+load("@io_bazel_rules_go//go:def.bzl", "go_library")
+
+go_library(
+    name = "go_default_library",
+    srcs = ["httpservicefoo.go"],
+    importpath = "github.com/uber-research/rpcshield/go/exampleapps/rpcshielddemo/gateway/httpservicefoo",
+    visibility = ["//visibility:public"],
+    deps = [
+        "//exampleapps/rpcshielddemo/util/httpclient:go_default_library",
+        "//exampleapps/rpcshielddemo/util/wrappedclient:go_default_library",
+    ],
+)

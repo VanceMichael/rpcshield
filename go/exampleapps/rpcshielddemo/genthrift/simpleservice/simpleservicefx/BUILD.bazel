@@ -1,0 +1,22 @@
+load("@io_bazel_rules_go//go:def.bzl", "go_library")
+
+# keep
+go_library(
+    name = "go_default_library",
+    srcs = [
+        "client.go",
+        "doc.go",
+        "server.go",
+    ],
+    importpath = "thriftrw/simpleservice/simpleservicefx",
+    visibility = ["//visibility:public"],
+    deps = [
+        "//exampleapps/rpcshielddemo/genthrift/simpleservice/simpleserviceclient:go_default_library",
+        "//exampleapps/rpcshielddemo/genthrift/simpleservice/simpleserviceserver:go_default_library",
+        "@org_uber_go_fx//:go_default_library",
+        "@org_uber_go_yarpc//:go_default_library",
+        "@org_uber_go_yarpc//api/transport:go_default_library",
+        "@org_uber_go_yarpc//api/x/restriction:go_default_library",
+        "@org_uber_go_yarpc//encoding/thrift:go_default_library",
+    ],
+)

@@ -1,0 +1,7 @@
+syntax = "proto3";
+
+package uber.infra.grail.catalog;
+
+option java_multiple_files = true;
+option java_outer_classname = "CatalogProto";
+option java_package = "com.uber.infra.grail.catalog";

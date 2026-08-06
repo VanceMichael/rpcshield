@@ -1,0 +1,70 @@
+We define a `Caller()-Callee()` pair to be fail-close, iff the `Callee()` invoked in the `Caller()` function implementation can influence `Caller()` to return a `non-nil` error.
+
+The example-1 below show a simple case of fail-close Caller-Callee pair.
+
+```
+func Caller(r Request) (Response, error) {
+   // ... some unrelated code
+   resp, err := Callee(...) // We want to know if this call is fail-close.
+   if err != nil {
+       return nil, err // This non-nil error return makes Caller-Callee pair fail-close.
+   }
+   // ... some unrelated code
+   c, err := AnotherUnrelatedCall(...)
+   if err != nil {
+       return nil, err
+   }
+   // ... some unrelated code
+   return a + resp + c, nil
+}
+```
+
+The example-2 below show a complicated case of fail-close Caller-Callee relationship, where the failure results from the value produced from `Callee()`.
+
+```
+func Caller(r Request) (Response, error) {
+   // ... some unrelated code
+   resp, err := Callee(...) // We want to know if this call is fail-close.
+   if err != nil {
+      log.Info("Callee returned error") // this is not fail-close here.
+   }
+   // ... some unrelated code
+   resp1 := someFuncCall(resp) // resp1 is derived from resp.
+   // ... some unrelated code
+   c, err := AnotherCallee(resp1) // resp1 derived from resp can make AnotherCallee() to return non-nil error
+   if err != nil {
+       return nil, err // resp1 derived from resp derived from Callee() can make AnotherCallee to fail making Caller-Callee pair fail-close.
+   }
+   // ... some code
+   return a + resp + c, nil
+}
+```
+
+If a `Caller()-Callee()` pair is not fail-close, it is fail-open.
+Example-3 below shows that `Caller()-Callee()` pair is fail-open.
+
+```
+func Caller(r Request) (Response, error) {
+   // ... some unrelated code
+   resp1, err1 := Callee(...) // Instance-1
+   if err1 != nil {
+      log.Log("log error") // only logs but does not return non-nil. Hence Caller-Callee instance-1 is fail-open.
+   }
+   resp2, err2 := Callee(...)  // Instance-2
+   if err != nil {
+       return nil, nil // Caller-Callee() instance-2 is also fail-open since we return nil here.
+   }
+  
+   // ... some unrelated code
+   c, err := AnotherUnrelatedCall(...)
+   if err != nil {
+       return nil, err // This non-nil error is unrelated to Caller-Callee pair
+   }
+   // ... some code
+   return a + resp + c, nil
+}
+```
+
+Pay attention to these additional coding idioms:
+1. In addition, if a non-nil error is returned via a customized error wrapper function, such as "NewError()", "NewClientError()", etc. , assume that error wrapper function continues to return a non-nil.
+2. Some Go Callers use named return, where the return value is set via an assignment.

@@ -1,0 +1,28 @@
+# keep
+load("@io_bazel_rules_go//go:def.bzl", "go_binary", "go_library", "go_path")
+
+go_library(
+    name = "go_default_library",
+    srcs = ["genericgrpcthrift.go"],
+    importpath = "github.com/uber-research/rpcshield/go/exampleapps/outbounds/genericgrpcthrift",
+    visibility = ["//visibility:public"],
+    deps = [
+        "//exampleapps/outbounds/genericgrpcthrift/pb:go_default_library",
+        "@org_golang_google_grpc//:go_default_library",
+    ],
+)
+
+go_binary(
+    name = "genericgrpcthrift",
+    embed = [":go_default_library"],
+    visibility = ["//visibility:public"],
+)
+
+# finder/outbound_test.go, finder/inbound_test.go (@rpcshield_ext) use this example as test input.
+go_path(
+    name = "genericgrpcthrift-anal",
+    testonly = True,
+    include_data = False,
+    visibility = ["//visibility:public"],
+    deps = [":genericgrpcthrift"],
+)

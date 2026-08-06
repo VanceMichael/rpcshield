@@ -1,0 +1,62 @@
+[
+  {
+    "group": "grail-test-svc-008",
+    "service_names": [
+      "grail-test-svc-014"
+    ]
+  },
+  {
+    "service_names": [
+      "grail-test-svc-016"
+    ],
+    "group": "grail-test-svc-016"
+  },
+  {
+    "group": "grail-test-svc-001",
+    "service_names": [
+      "grail-test-svc-003"
+    ]
+  },
+  {
+    "group": "grail-test-svc-023",
+    "service_names": [
+      "grail-test-svc-023"
+    ]
+  },
+  {
+    "group": "grail-test-svc-031",
+    "service_names": [
+      "grail-test-svc-031"
+    ]
+  },
+  {
+    "group": "grail-test-svc-027",
+    "service_names": [
+      "grail-test-svc-030"
+    ]
+  },
+  {
+    "service_names": [
+      "grail-test-svc-017"
+    ],
+    "group": "grail-test-svc-007"
+  },
+  {
+    "group": "grail-test-svc-002",
+    "service_names": [
+      "grail-test-svc-009"
+    ]
+  },
+  {
+    "group": "grail-test-svc-024",
+    "service_names": [
+      "grail-test-svc-024"
+    ]
+  },
+  {
+    "group": "grail-test-svc-006",
+    "service_names": [
+      "grail-test-svc-006"
+    ]
+  }
+]

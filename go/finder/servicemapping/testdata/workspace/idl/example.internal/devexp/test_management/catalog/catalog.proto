@@ -1,0 +1,6 @@
+syntax = "proto3";
+
+package uber.infra.grail.catalog;
+
+option go_package = "catalogpb";
+

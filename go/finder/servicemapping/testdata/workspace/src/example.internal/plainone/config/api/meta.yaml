@@ -1,0 +1,10 @@
+files:
+  - ../base.yaml
+  - base.yaml
+  - ../${UBER_RUNTIME_ENVIRONMENT:staging}.yaml
+  - ${UBER_RUNTIME_ENVIRONMENT:staging}.yaml
+  - ${PWD}/base.yaml
+  - ${NON_EXISTENT}-file.yaml
+  - ${NON_EXISTENT_DEFAULT:default}.yaml
+  - ../secrets.yaml
+  - secrets.yaml

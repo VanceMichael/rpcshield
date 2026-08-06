@@ -1,0 +1,17 @@
+load("@io_bazel_rules_go//go:def.bzl", "go_library")
+
+# keep
+go_library(
+    name = "go_default_library",
+    srcs = [
+        "cache.go",
+        "common.go",
+    ],
+    importpath = "github.com/uber-research/rpcshield/go/cmd/rpcshield/common",
+    visibility = ["//visibility:public"],
+    deps = [
+        "@org_uber_go_zap//:go_default_library",
+        "@org_uber_go_zap//zapcore:go_default_library",
+    ],
+)
+

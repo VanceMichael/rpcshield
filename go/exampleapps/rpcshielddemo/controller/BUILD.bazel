@@ -1,0 +1,19 @@
+load("@io_bazel_rules_go//go:def.bzl", "go_library")
+
+# controller.go carries the //go:build cff tag and is the cff source-of-truth; it is NOT
+# compiled directly. controller_gen.go is the checked-in output of running the OSS `cff`
+# codegen binary (go.uber.org/cff/cmd/cff) against controller.go -- see
+# exampleapps/cffapp/BUILD.bazel for the regen command.
+# keep
+go_library(
+    name = "go_default_library",
+    srcs = ["controller_gen.go"],
+    importpath = "github.com/uber-research/rpcshield/go/exampleapps/rpcshielddemo/controller",
+    visibility = ["//visibility:public"],
+    deps = [
+        "//exampleapps/rpcshielddemo/gateway/httpservicefoo:go_default_library",
+        "//exampleapps/rpcshielddemo/gateway/lottery:go_default_library",
+        "@org_golang_x_sync//errgroup:go_default_library",
+        "@org_uber_go_cff//:go_default_library",
+    ],
+)

@@ -1,0 +1,32 @@
+load("@io_bazel_rules_go//go:def.bzl", "go_binary", "go_library", "go_path")
+
+# app.go carries the //go:build cff tag and is the cff source-of-truth; it is NOT compiled
+# directly. app_gen.go is the checked-in ground truth for what the CURRENT internal `cff` codegen
+# tool actually emits for this shape (cff.SliceEnd) -- captured via
+# `bazel build --output_groups=go_generated_srcs` against a throwaway internal fixture and adapted
+# here (see app_gen.go's doc comment; same provenance/shape as cffappctxlessslice).
+# keep
+go_library(
+    name = "go_default_library",
+    srcs = ["app_gen.go"],
+    importpath = "github.com/uber-research/rpcshield/go/exampleapps/cffappsliceend",
+    visibility = ["//visibility:public"],
+    deps = [
+        "@org_uber_go_cff//:go_default_library",
+    ],
+)
+
+go_binary(
+    name = "cffappsliceend",
+    embed = [":go_default_library"],
+    visibility = ["//visibility:public"],
+)
+
+# graph/cffenricher_test.go (@rpcshield_ext) uses this example as test input.
+go_path(
+    name = "cffappsliceend-anal",
+    testonly = True,
+    include_data = False,
+    visibility = ["//visibility:public"],
+    deps = [":cffappsliceend"],
+)

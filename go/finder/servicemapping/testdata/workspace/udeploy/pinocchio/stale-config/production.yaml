@@ -1,0 +1,11 @@
+schema_version: 2.0.0
+service_name: simple-service
+service_type: go_standard
+go_standard:
+  bazel_targets:
+    - //src/example.internal/plaintwo/handler/cmd:plaintwo
+env_vars:
+  - name: UBER_CONFIG_DIR
+    # This value marks a non-existent config directory within the monorepo, which happens in
+    # practice. This tests our graceful handling of such cases (i.e., simply ignoring this config).
+    value: "src/example.internal/non-exitent-service/config"

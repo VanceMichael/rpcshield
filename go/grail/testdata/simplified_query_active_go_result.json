@@ -1,0 +1,46 @@
+{
+  "result": [
+    {
+      "name": "grail-test-svc-029",
+      "tier": 2
+    },
+    {
+      "name": "grail-test-svc-021",
+      "tier": 1
+    },
+    {
+      "name": "grail-test-svc-005",
+      "tier": 2
+    },
+    {
+      "name": "grail-test-svc-028",
+      "tier": 0
+    },
+    {
+      "name": "grail-test-svc-026",
+      "tier": 1
+    },
+    {
+      "name": "grail-test-svc-025",
+      "tier": 0
+    },
+    {
+      "name": "grail-test-svc-018",
+      "tier": 2
+    },
+    {
+      "name": "grail-test-svc-022",
+      "tier": 1
+    }
+  ],
+  "count": 1234,
+  "total": 1234,
+  "cost": 12345,
+  "instance": {
+    "frontend": "compute",
+    "environment": "production",
+    "zone": "dca24",
+    "region": "dca",
+    "host": "dca24-c2t"
+  }
+}

@@ -1,0 +1,31 @@
+# keep
+load("@io_bazel_rules_go//go:def.bzl", "go_library", "go_test")
+
+go_library(
+    name = "go_default_library",
+    srcs = [
+        "cleanup.go",
+        "extract.go",
+        "util.go",
+    ],
+    importpath = "github.com/uber-research/rpcshield/go/skeletonize",
+    visibility = ["//visibility:public"],
+    deps = [
+        "@com_github_smacker_go_tree_sitter//:go_default_library",
+        "@com_github_smacker_go_tree_sitter//golang:go_default_library",
+        "@org_uber_go_zap//:go_default_library",
+    ],
+)
+
+go_test(
+    name = "go_default_test",
+    srcs = ["extract_test.go"],
+    data = glob(["testdata/**"]),
+    embed = [":go_default_library"],
+    deps = [
+        "@com_github_smacker_go_tree_sitter//:go_default_library",
+        "@com_github_smacker_go_tree_sitter//golang:go_default_library",
+        "@com_github_stretchr_testify//require:go_default_library",
+        "@org_uber_go_zap//:go_default_library",
+    ],
+)

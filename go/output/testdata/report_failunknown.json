@@ -1,0 +1,74 @@
+{
+    "inbound": {
+        "service": {
+            "name": "cff-demo",
+            "tier": -1,
+            "git_uri": ""
+        },
+        "api_name": "uber.infra.progsys.cffdemo.cffdemo__create"
+    },
+    "outbound": {
+        "service": {
+            "name": "lottery",
+            "tier": 5,
+            "git_uri": "gitolite@example.internal:go-code"
+        },
+        "api_name": "lottery__play"
+    },
+    "path_results": [
+        {
+            "edges": [
+                {
+                    "caller": "(*example.internal/infra/progsys/cff-demo/gateway/lottery.gateway).Play",
+                    "callee": "(thriftrw/example.internal/infra/lottery/lottery/lotteryclient.Interface).Play",
+                    "file_path": "src/example.internal/infra/progsys/cff-demo/gateway/lottery/lottery.go",
+                    "source_graph_link": "https://sourcegraph.example.com/example.internal/uber-code/go-code@5003bad38df28f72e5ceeab27040adc11cac7c69/-/blob/src/example.internal/infra/progsys/cff-demo/gateway/lottery/lottery.go?L34",
+                    "analyzer_output": {
+                        "status": "FailClose",
+                        "diagnostic_msg": "",
+                        "source": "SSA"
+                    },
+                    "errors": null
+                },
+                {
+                    "caller": "(*example.internal/infra/progsys/cff-demo/controller/cff-demo.controller).Create$2",
+                    "callee": "(example.internal/infra/progsys/cff-demo/gateway/lottery.Gateway).Play",
+                    "file_path": "src/example.internal/infra/progsys/cff-demo/controller/cff-demo/cff_demo_cffgen.go",
+                    "source_graph_link": "https://sourcegraph.example.com/example.internal/uber-code/go-code@5003bad38df28f72e5ceeab27040adc11cac7c69/-/blob/src/example.internal/infra/progsys/cff-demo/controller/cff-demo/cff_demo_cffgen.go?L52",
+                    "analyzer_output": {
+                        "status": "FailClose",
+                        "diagnostic_msg": "",
+                        "source": "SSA"
+                    },
+                    "errors": null
+                },
+                {
+                    "caller": "(*example.internal/infra/progsys/cff-demo/controller/cff-demo.controller).Create",
+                    "callee": "example.internal/infra/progsys/cff-demo/controller/cff-demo._cffFlowcffdemo_43_9",
+                    "file_path": "src/example.internal/infra/progsys/cff-demo/controller/cff-demo/cff_demo_cffgen.go",
+                    "source_graph_link": "https://sourcegraph.example.com/example.internal/uber-code/go-code@5003bad38df28f72e5ceeab27040adc11cac7c69/-/blob/src/example.internal/infra/progsys/cff-demo/controller/cff-demo/cff_demo_cffgen.go?L43",
+                    "analyzer_output": {
+                        "status": "FailUnknownWithError",
+                        "diagnostic_msg": "",
+                        "source": "SSA"
+                    },
+                    "errors": null
+                },
+                {
+                    "caller": "(*example.internal/infra/progsys/cff-demo/handler/cff-demo.handler).Create",
+                    "callee": "(example.internal/infra/progsys/cff-demo/controller/cff-demo.Controller).Create",
+                    "file_path": "src/example.internal/infra/progsys/cff-demo/handler/cff-demo/cff_demo.go",
+                    "source_graph_link": "https://sourcegraph.example.com/example.internal/uber-code/go-code@5003bad38df28f72e5ceeab27040adc11cac7c69/-/blob/src/example.internal/infra/progsys/cff-demo/handler/cff-demo/cff_demo.go?L28",
+                    "analyzer_output": {
+                        "status": "FailUnknown",
+                        "diagnostic_msg": "Fail close since at least one path is found in the function that returns an error influenced by the callsite",
+                        "source": "AST"
+                    },
+                    "errors": null
+                }
+            ],
+            "status": "FailUnknown"
+        }
+    ],
+    "status": "FailUnknown"
+}

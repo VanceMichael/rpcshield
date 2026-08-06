@@ -1,0 +1,14 @@
+# This is the production config file, which gets merged with the base.yaml file. Here we put
+# an additional alias mapping, where our analysis should be able to detect.
+yarpc:
+  outbounds:
+    service-0018-alias:
+      service: service-0018
+      tchannel:
+        with: muttley
+    service-0046-alias:
+      # This conflicts with the service name in base.yaml, but we should prefer this one since
+      # it is a production-specific config.
+      service: service-0046
+      tchannel:
+        with: muttley

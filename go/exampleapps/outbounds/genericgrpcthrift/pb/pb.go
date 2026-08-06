@@ -1,0 +1,56 @@
+// Package pb is a fixture reproducing the exact structural shapes protoc-gen-go-grpc and Apache
+// Thrift's Go codegen produce, used by finder/outbound_test.go and finder/inbound_test.go
+// (@rpcshield_ext) to exercise isGenericGRPCClient/isGenericThriftClient and
+// findGenericGRPCServer/findGenericThriftServer against real google.golang.org/grpc and
+// github.com/apache/thrift/lib/go/thrift types (types.Named identity requires resolving a real
+// import, not a locally-declared lookalike type). Kept in a separate package from its caller so
+// the RegisterFooServer/NewBarProcessor call sites are package-qualified, matching how real
+// generated code is always imported and called from outside its own package.
+package pb
+
+import (
+	"context"
+
+	"github.com/apache/thrift/lib/go/thrift"
+	"google.golang.org/grpc"
+)
+
+// FooClient mimics the shape every protoc-gen-go-grpc-generated "xxxClient" struct has.
+type FooClient struct {
+	cc grpc.ClientConnInterface
+}
+
+// Foo makes an outbound gRPC call, the shape isGenericGRPCClient/genericGRPCThriftOutbound
+// should detect.
+func (c *FooClient) Foo(ctx context.Context) error {
+	return c.cc.Invoke(ctx, "/fixture.Foo/Foo", nil, nil)
+}
+
+// FooServer is a fake generated gRPC server interface.
+type FooServer interface {
+	Foo(context.Context) error
+}
+
+// RegisterFooServer mimics the shape protoc-gen-go-grpc generates for every service.
+func RegisterFooServer(s grpc.ServiceRegistrar, srv FooServer) {}
+
+// BarClient mimics the shape Apache Thrift's Go codegen produces for a client.
+type BarClient struct {
+	c thrift.TClient
+}
+
+// Bar makes an outbound Thrift call, the shape isGenericThriftClient/genericGRPCThriftOutbound
+// should detect.
+func (c *BarClient) Bar(ctx context.Context) error {
+	_, err := c.c.Call(ctx, "Bar", nil, nil)
+	return err
+}
+
+// BarHandler is a fake generated Thrift handler interface.
+type BarHandler interface {
+	Bar(context.Context) error
+}
+
+// NewBarProcessor mimics the shape Apache Thrift's Go codegen produces for every service's
+// processor constructor.
+func NewBarProcessor(handler BarHandler) thrift.TProcessor { return nil }

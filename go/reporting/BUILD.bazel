@@ -1,0 +1,34 @@
+# keep
+load("@io_bazel_rules_go//go:def.bzl", "go_library", "go_test")
+
+go_library(
+    name = "go_default_library",
+    srcs = [
+        "csv.go",
+        "html.go",
+    ],
+    embedsrcs = ["htmltemplate.txt"],
+    importpath = "github.com/uber-research/rpcshield/go/reporting",
+    visibility = ["//visibility:public"],
+    deps = [
+        "//constant:go_default_library",
+        "//grail:go_default_library",
+        "//output:go_default_library",
+    ],
+)
+
+go_test(
+    name = "go_default_test",
+    size = "large",
+    srcs = [
+        "csv_test.go",
+        "html_test.go",
+    ],
+    embed = [":go_default_library"],
+    deps = [
+        "//constant:go_default_library",
+        "//grail:go_default_library",
+        "//output:go_default_library",
+        "@com_github_stretchr_testify//require:go_default_library",
+    ],
+)

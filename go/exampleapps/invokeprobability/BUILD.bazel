@@ -1,0 +1,28 @@
+load("@io_bazel_rules_go//go:def.bzl", "go_binary", "go_library", "go_path")
+
+go_library(
+    name = "go_default_library",
+    srcs = ["app.go"],
+    importpath = "github.com/uber-research/rpcshield/go/exampleapps/invokeprobability",
+    visibility = ["//visibility:public"],
+    deps = [
+        "//exampleapps/invokeprobability/a/b/c/d:go_default_library",
+        "//exampleapps/invokeprobability/a/b/c/x:go_default_library",
+        "//exampleapps/invokeprobability/a/m/o/p:go_default_library",
+    ],
+)
+
+go_binary(
+    name = "invokeprobability",
+    embed = [":go_default_library"],
+    visibility = ["//visibility:public"],
+)
+
+# rpcshield (github.com/uber-research/rpcshield/go) uses this example as test input.
+go_path(
+    name = "invokeprobability-anal",
+    testonly = True,
+    include_data = False,
+    visibility = ["//visibility:public"],
+    deps = [":invokeprobability"],
+)

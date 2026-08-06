@@ -1,0 +1,12 @@
+name,repo,tag,dir,pkg,service_name,codebase_pkg_prefix,drop_exclude_package_patterns
+etcd-server,https://github.com/etcd-io/etcd,v3.5.17,etcd/server,.,etcd-server,go.etcd.io/etcd,
+temporal-server,https://github.com/temporalio/temporal,v1.24.3,temporal,./cmd/server,temporal-server,go.temporal.io/server,
+thanos,https://github.com/thanos-io/thanos,v0.35.1,thanos,./cmd/thanos,thanos,github.com/thanos-io/thanos,
+argo-server,https://github.com/argoproj/argo-workflows,v3.5.8,argo-workflows,./cmd/argo,argo-server,github.com/argoproj/argo-workflows,
+vitess-vtgate,https://github.com/vitessio/vitess,v0.21.1,vitess,./go/cmd/vtgate,vitess-vtgate,vitess.io/vitess,
+cortex,https://github.com/cortexproject/cortex,v1.17.1,cortex,./cmd/cortex,cortex,github.com/cortexproject/cortex,
+vitess-vttablet,https://github.com/vitessio/vitess,v0.21.1,vitess,./go/cmd/vttablet,vitess-vttablet,vitess.io/vitess,
+trillian-log-server,https://github.com/google/trillian,v1.7.1,trillian,./cmd/trillian_log_server,trillian-log-server,github.com/google/trillian,
+loki,https://github.com/grafana/loki,v3.2.1,loki,./cmd/loki,loki,github.com/grafana/loki/v3,
+jaeger-collector,https://github.com/jaegertracing/jaeger,v1.62.0,jaeger,./cmd/collector,jaeger-collector,github.com/jaegertracing/jaeger,^github.com/jaegertracing(/.*)?$
+jaeger-remote-storage,https://github.com/jaegertracing/jaeger,v1.62.0,jaeger,./cmd/remote-storage,jaeger-remote-storage,github.com/jaegertracing/jaeger,^github.com/jaegertracing(/.*)?$

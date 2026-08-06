@@ -1,0 +1,51 @@
+version: "2"
+
+# Moderate linter set for adopting lint on a large pre-existing codebase: correctness-focused
+# checks that are cheap to fix incrementally, without a mass reformat/cleanup up front. CI (see
+# .github/workflows/lint.yml) runs this with `--new-from-rev` on pull requests, so existing
+# findings don't block adoption -- only newly introduced/changed lines must be clean.
+#
+# NOTE: four packages are entirely excluded from the lint.yml invocation itself (not just from
+# reported findings here -- see that workflow's comment): the root package, output/, genai/, and
+# common/utils/ each have a _test.go file that imports Bazel's gomock-generated mocks via a
+# `mock/github.com/...` importmap path, which only resolves inside Bazel's build graph, not under
+# plain `go vet`/golangci-lint's go/packages loader. Path-based exclusions below only filter
+# reported issues after a package successfully loads -- they can't rescue a package that fails to
+# load in the first place, which is why that exclusion has to happen at the package-list level in
+# the workflow instead of here.
+linters:
+  default: none
+  enable:
+    - govet
+    - staticcheck
+    - unused
+    - ineffassign
+    - misspell
+    - unconvert
+    - errcheck
+  exclusions:
+    generated: strict
+    paths:
+      - pipeline_evaluation_scripts/datasets
+      - pipeline_evaluation_scripts/fixtures
+      - third_party
+      - exampleapps
+      - testdata
+      - bazel-.*
+
+formatters:
+  enable:
+    - gofmt
+    - goimports
+  exclusions:
+    generated: strict
+    paths:
+      - pipeline_evaluation_scripts/datasets
+      - pipeline_evaluation_scripts/fixtures
+      - third_party
+      - exampleapps
+      - testdata
+      - bazel-.*
+
+run:
+  timeout: 10m

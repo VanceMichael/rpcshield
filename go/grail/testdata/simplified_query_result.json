@@ -1,0 +1,64 @@
+{
+  "result": [
+    {
+      "name": "grail-test-svc-015",
+      "tier": 3,
+      "git_uri": "gitolite@example.internal:lm/fievel"
+    },
+    {
+      "name": "grail-test-svc-029",
+      "tier": 2,
+      "git_uri": "gitolite@example.internal:go-code"
+    },
+    {
+      "git_uri": "gitolite@example.internal:lm/fievel",
+      "name": "grail-test-svc-004",
+      "tier": 2
+    },
+    {
+      "git_uri": null,
+      "name": "grail-test-svc-012",
+      "tier": 5
+    },
+    {
+      "tier": 5,
+      "git_uri": "gitolite@example.internal:go-code",
+      "name": "grail-test-svc-011"
+    },
+    {
+      "git_uri": "gitolite@example.internal:go-code",
+      "name": "grail-test-svc-010",
+      "tier": 5
+    },
+    {
+      "tier": 5,
+      "git_uri": "gitolite@example.internal:go-code/src/example.internal/storage/odin/experimental/serverless/services/examples/grpc-handler",
+      "name": "grail-test-svc-019"
+    },
+    {
+      "tier": 1,
+      "git_uri": "gitolite@example.internal:go-code",
+      "name": "grail-test-svc-021"
+    },
+    {
+      "tier": 5,
+      "git_uri": "gitolite@example.internal:go-code",
+      "name": "grail-test-svc-020"
+    },
+    {
+      "name": "grail-test-svc-013",
+      "tier": 5,
+      "git_uri": "gitolite@example.internal:go-code"
+    }
+  ],
+  "count": 14990,
+  "total": 14990,
+  "cost": 146827,
+  "instance": {
+    "frontend": "compute",
+    "environment": "production",
+    "zone": "dca24",
+    "region": "dca",
+    "host": "dca24-c2t"
+  }
+}

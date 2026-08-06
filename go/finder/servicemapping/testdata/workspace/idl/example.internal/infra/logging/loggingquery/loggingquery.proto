@@ -1,0 +1,8 @@
+syntax = "proto3";
+
+package uber.infra.logging.loggingquery;
+
+option go_package = "loggingquerypb";
+option java_multiple_files = true;
+option java_outer_classname = "LoggingqueryProto";
+option java_package = "com.uber.infra.logging.loggingquery";

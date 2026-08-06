@@ -1,0 +1,28 @@
+# keep
+load("@io_bazel_rules_go//go:def.bzl", "go_library", "go_test")
+
+go_library(
+    name = "go_default_library",
+    srcs = ["anonymousfunc.go"],
+    importpath = "github.com/uber-research/rpcshield/go/staticanalyzer/anonymousfunc",
+    visibility = ["//visibility:public"],
+    deps = [
+        "@org_golang_x_tools//go/packages:go_default_library",
+    ],
+)
+
+go_test(
+    name = "go_default_test",
+    size = "large",  # Loads and type-checks testdata packages via the Go toolchain; small (60s) times out.
+    srcs = ["anonymousfunc_test.go"],
+    data = [
+        "//:testdata",
+        "//staticanalyzer/function:testdata",
+        "@go_sdk//:files",
+    ],
+    embed = [":go_default_library"],
+    deps = [
+        "//loader:go_default_library",
+        "@com_github_stretchr_testify//require:go_default_library",
+    ],
+)

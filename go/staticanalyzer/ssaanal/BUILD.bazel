@@ -1,0 +1,58 @@
+# keep
+load("@io_bazel_rules_go//go:def.bzl", "go_library", "go_test")
+
+go_library(
+    name = "go_default_library",
+    srcs = [
+        "lattice.go",
+        "nilcheck.go",
+        "options.go",
+        "reachable.go",
+        "root_source.go",
+        "sccp_analyze.go",
+        "sccp_facts.go",
+        "sccp_metrics.go",
+        "simple.go",
+        "source.go",
+        "state.go",
+    ],
+    importpath = "github.com/uber-research/rpcshield/go/staticanalyzer/ssaanal",
+    visibility = ["//visibility:public"],
+    deps = [
+        "//constant:go_default_library",
+        "//staticanalyzer/ssahelper/cdg:go_default_library",
+        "@org_golang_x_tools//go/ssa:go_default_library",
+        "@org_uber_go_zap//:go_default_library",
+    ],
+)
+
+go_test(
+    name = "go_default_test",
+    timeout = "long",
+    srcs = [
+        "lattice_test.go",
+        "nilcheck_test.go",
+        "options_test.go",
+        "reachable_test.go",
+        "root_source_test.go",
+        "sccp_facts_test.go",
+        "sccp_metrics_test.go",
+        "simple_test.go",
+        "source_test.go",
+        "state_test.go",
+    ],
+    data = [
+        "//exampleapps/errreturns:errreturns-anal",
+        "@go_sdk//:files",
+    ],
+    embed = [":go_default_library"],
+    deps = [
+        "//constant:go_default_library",
+        "//loader:go_default_library",
+        "@com_github_stretchr_testify//require:go_default_library",
+        "@org_golang_x_tools//go/packages:go_default_library",
+        "@org_golang_x_tools//go/ssa:go_default_library",
+        "@org_golang_x_tools//go/ssa/ssautil:go_default_library",
+        "@org_uber_go_zap//:go_default_library",
+    ],
+)

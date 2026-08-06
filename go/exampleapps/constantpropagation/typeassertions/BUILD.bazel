@@ -1,0 +1,22 @@
+load("@io_bazel_rules_go//go:def.bzl", "go_binary", "go_library", "go_path")
+
+go_library(
+    name = "go_default_library",
+    srcs = ["app.go"],
+    importpath = "github.com/uber-research/rpcshield/go/exampleapps/constantpropagation/typeassertions",
+    visibility = ["//visibility:public"],
+)
+
+go_path(
+    name = "typeassertions-anal",
+    testonly = True,
+    include_data = False,
+    visibility = ["//visibility:public"],
+    deps = [":typeassertions"],
+)
+
+go_binary(
+    name = "typeassertions",
+    embed = [":go_default_library"],
+    visibility = ["//visibility:public"],
+)

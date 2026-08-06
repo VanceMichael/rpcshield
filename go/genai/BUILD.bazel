@@ -1,0 +1,64 @@
+# gazelle:gomock interfaces=Client library=github.com/uber-research/rpcshield/go/genai extra_imports=github.com/sashabaranov/go-openai,go.uber.org/mock/gomock
+# keep
+load("@io_bazel_rules_go//extras:gomock.bzl", "gomock")
+load("@io_bazel_rules_go//go:def.bzl", "go_library", "go_test")
+
+go_library(
+    name = "go_default_library",
+    srcs = [
+        "genai.go",
+        "yaml.go",
+    ],
+    embedsrcs = [
+        "promptskeleton_go.txt",
+        "promptskeleton_java.txt",
+    ],
+    importpath = "github.com/uber-research/rpcshield/go/genai",
+    visibility = ["//visibility:public"],
+    deps = [
+        "//constant:go_default_library",
+        "//input:go_default_library",
+        "//output:go_default_library",
+        "//skeletonize:go_default_library",
+        "@com_github_sashabaranov_go_openai//:go_default_library",
+        "@in_gopkg_yaml_v3//:go_default_library",
+        "@org_uber_go_zap//:go_default_library",
+    ],
+)
+
+go_test(
+    name = "go_default_test",
+    srcs = ["genai_test.go"],
+    data = ["//:testdata"] + glob(["testdata/**"]),
+    embed = [":go_default_library"],
+    deps = [
+        ":go_genai_gomock_library",
+        "//input:go_default_library",
+        "@com_github_sashabaranov_go_openai//:go_default_library",
+        "@com_github_stretchr_testify//require:go_default_library",
+        "@org_uber_go_mock//gomock:go_default_library",
+        "@org_uber_go_zap//:go_default_library",
+    ],
+)
+
+gomock(
+    name = "genai_gomock",
+    out = "genaimock.go",
+    imports = {"openai": "github.com/sashabaranov/go-openai"},
+    mockgen_tool = "@org_uber_go_mock//mockgen",
+    package = "genaimock",
+    self_package = "mock/github.com/uber-research/rpcshield/go/genai/genaimock",
+    source = "genai.go",
+    source_importpath = "github.com/uber-research/rpcshield/go/genai",
+)
+
+go_library(
+    name = "go_genai_gomock_library",
+    srcs = ["genaimock.go"],
+    importpath = "mock/github.com/uber-research/rpcshield/go/genai/genaimock",
+    visibility = ["//visibility:public"],
+    deps = [
+        "@com_github_sashabaranov_go_openai//:go_default_library",
+        "@org_uber_go_mock//gomock:go_default_library",
+    ],
+)

@@ -1,0 +1,31 @@
+load("@io_bazel_rules_go//go:def.bzl", "go_binary", "go_library", "go_path")
+
+# app.go carries the //go:build cff tag and is the cff source-of-truth; it is NOT compiled
+# directly. app_gen.go is the checked-in output of running the OSS `cff` codegen binary
+# (go.uber.org/cff/cmd/cff) against app.go -- see exampleapps/cffapp/BUILD.bazel for the
+# regen command.
+# keep
+go_library(
+    name = "go_default_library",
+    srcs = ["app_gen.go"],
+    importpath = "github.com/uber-research/rpcshield/go/exampleapps/cfffallback",
+    visibility = ["//visibility:private"],
+    deps = [
+        "@org_uber_go_cff//:go_default_library",
+    ],
+)
+
+go_binary(
+    name = "cfffallback",
+    embed = [":go_default_library"],
+    visibility = ["//visibility:public"],
+)
+
+# graph/cffenricher_test.go (@rpcshield_ext) uses this example as test input.
+go_path(
+    name = "cfffallback-anal",
+    testonly = True,
+    include_data = False,
+    visibility = ["//visibility:public"],
+    deps = [":cfffallback"],
+)

@@ -1,0 +1,23 @@
+up::environment:* (
+  EXCLUDE __id
+  FIELD slm::Environment.name AS environment_name
+  FIELD slm::Environment.type AS environment_type
+
+  FOLLOW up::service AS service (
+    FIELD slm::Service.name AS service_name
+  )
+
+  FIELD service.service_name AS service_name
+  EXCLUDE service
+
+  SCAN up::addon AS addons (
+    FIELD slm::Addon.compute_goal_state.namespace AS namespace
+    FIELD slm::Addon.compute_goal_state.ufa_spec.burst_strategy AS burst_strategy
+    WHERE slm::Addon.type = "compute"
+  )
+  WHERE len(addons) > 0 and slm::Environment.type = "ENVIRONMENT_TYPE_PROD"
+  EXCLUDE addons
+
+  FIELD addons[0].namespace AS namespace
+  FIELD addons[0].burst_strategy AS burst_strategy
+)

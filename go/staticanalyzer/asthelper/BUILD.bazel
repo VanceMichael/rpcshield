@@ -1,0 +1,19 @@
+# keep
+load("@io_bazel_rules_go//go:def.bzl", "go_library")
+
+go_library(
+    name = "go_default_library",
+    srcs = [
+        "asthelper.go",
+        "trustedexpr.go",
+        "trustedsuppression.go",
+    ],
+    importpath = "github.com/uber-research/rpcshield/go/staticanalyzer/asthelper",
+    visibility = ["//visibility:public"],
+    deps = [
+        "//common/pkgdeps:go_default_library",
+        "//constant:go_default_library",
+        "//staticanalyzer/anonymousfunc:go_default_library",
+        "@org_golang_x_tools//go/packages:go_default_library",
+    ],
+)

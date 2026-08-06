@@ -1,0 +1,37 @@
+# keep
+load("@io_bazel_rules_go//go:def.bzl", "go_binary", "go_library", "go_path")
+
+go_library(
+    name = "go_default_library",
+    srcs = ["app.go"],
+    importpath = "github.com/uber-research/rpcshield/go/exampleapps/errgroup",
+    visibility = ["//visibility:private"],
+    deps = [
+        "//exampleapps/errgroup/viainterface:go_default_library",
+        "//features/errgroup/ce:go_default_library",
+        "//features/errgroup/locationstore:go_default_library",
+        "//features/errgroup/orderplatform:go_default_library",
+        "//features/errgroup/statsdex:go_default_library",
+        "//features/errgroup/throttled:go_default_library",
+        "//features/errgroup/tpp:go_default_library",
+        "//features/errgroup/u4b:go_default_library",
+        "//features/errgroup/workgroup:go_default_library",
+        "//features/safego/safegroup:go_default_library",
+        "@org_golang_x_sync//errgroup:go_default_library",
+    ],
+)
+
+go_binary(
+    name = "errgroup",
+    embed = [":go_default_library"],
+    visibility = ["//visibility:public"],
+)
+
+# graph/errgroupenricher_test.go uses this example as test input.
+go_path(
+    name = "errgroup-anal",
+    testonly = True,
+    include_data = False,
+    visibility = ["//visibility:public"],
+    deps = [":errgroup"],
+)

@@ -1,0 +1,18 @@
+load("@io_bazel_rules_go//go:def.bzl", "go_library")
+
+# gazelle:resolve go gogoproto/rpcshielddemo //exampleapps/rpcshielddemo/genproto/rpcshielddemo:go_default_library
+go_library(
+    name = "go_default_library",
+    srcs = [
+        "handler.go",
+        "kafka.go",
+        "value_receiver_handler.go",
+    ],
+    importpath = "github.com/uber-research/rpcshield/go/exampleapps/rpcshielddemo/handler",
+    visibility = ["//visibility:public"],
+    deps = [
+        "//exampleapps/rpcshielddemo/controller:go_default_library",
+        "//exampleapps/rpcshielddemo/genproto/rpcshielddemo:go_default_library",
+        "//exampleapps/rpcshielddemo/pkg/nopservice:go_default_library",
+    ],
+)

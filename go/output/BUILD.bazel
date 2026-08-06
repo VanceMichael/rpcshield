@@ -1,0 +1,61 @@
+# gazelle:gomock interfaces=Runner library=github.com/uber-research/rpcshield/go/output extra_imports=go.uber.org/mock/gomock
+# keep
+load("@io_bazel_rules_go//extras:gomock.bzl", "gomock")
+load("@io_bazel_rules_go//go:def.bzl", "go_library", "go_test")
+
+go_library(
+    name = "go_default_library",
+    srcs = [
+        "htmlreport.go",
+        "output.go",
+    ],
+    data = glob(["flamegraph.pl"]),
+    embedsrcs = ["htmltemplate.txt"],
+    importpath = "github.com/uber-research/rpcshield/go/output",
+    visibility = ["//visibility:public"],
+    deps = [
+        "//callnode:go_default_library",
+        "//common/utils:go_default_library",
+        "//constant:go_default_library",
+        "//grail:go_default_library",
+        "@io_bazel_rules_go//go/runfiles:go_default_library",
+    ],
+)
+
+go_test(
+    name = "go_default_test",
+    size = "large",
+    srcs = [
+        "htmlreport_test.go",
+        "output_test.go",
+    ],
+    data = glob(["testdata/**"]),
+    embed = [":go_default_library"],
+    visibility = ["//visibility:public"],
+    deps = [
+        ":go_output_gomock_library",
+        "//callnode:go_default_library",
+        "//constant:go_default_library",
+        "//grail:go_default_library",
+        "@com_github_stretchr_testify//require:go_default_library",
+        "@org_uber_go_mock//gomock:go_default_library",
+    ],
+)
+
+gomock(
+    name = "runner_gomock",
+    out = "runner_mock.go",
+    mockgen_tool = "@org_uber_go_mock//mockgen",
+    package = "outputmock",
+    self_package = "mock/github.com/uber-research/rpcshield/go/output/outputmock",
+    source = "output.go",
+    source_importpath = "github.com/uber-research/rpcshield/go/output",
+)
+
+go_library(
+    name = "go_output_gomock_library",
+    srcs = ["runner_mock.go"],
+    importpath = "mock/github.com/uber-research/rpcshield/go/output/outputmock",
+    visibility = ["//visibility:public"],
+    deps = ["@org_uber_go_mock//gomock:go_default_library"],
+)

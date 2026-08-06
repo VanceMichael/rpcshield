@@ -1,0 +1,17 @@
+# keep
+load("@io_bazel_rules_go//go:def.bzl", "go_library", "go_test")
+
+go_library(
+    name = "go_default_library",
+    srcs = ["query.go"],
+    importpath = "github.com/uber-research/rpcshield/go/query",
+    visibility = ["//visibility:public"],
+)
+
+go_test(
+    name = "go_default_test",
+    srcs = ["query_test.go"],
+    embed = [":go_default_library"],
+    embedsrcs = ["prod_service_traffic_no_ib_ob.json"],
+    deps = ["@com_github_stretchr_testify//require:go_default_library"],
+)

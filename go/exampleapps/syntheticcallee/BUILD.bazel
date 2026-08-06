@@ -1,0 +1,24 @@
+# keep
+load("@io_bazel_rules_go//go:def.bzl", "go_binary", "go_library", "go_path")
+
+go_library(
+    name = "go_default_library",
+    srcs = ["app.go"],
+    importpath = "github.com/uber-research/rpcshield/go/exampleapps/syntheticcallee",
+    visibility = ["//visibility:private"],
+)
+
+go_binary(
+    name = "syntheticcallee",
+    embed = [":go_default_library"],
+    visibility = ["//visibility:public"],
+)
+
+# common/syntheticfunc uses this example as test input.
+go_path(
+    name = "syntheticcallee-anal",
+    testonly = True,
+    include_data = False,
+    visibility = ["//visibility:public"],
+    deps = [":syntheticcallee"],
+)

@@ -1,0 +1,42 @@
+[
+  {
+    "name": "grail-test-svc-029",
+    "tier": 2,
+    "git_uri": ""
+  },
+  {
+    "name": "grail-test-svc-021",
+    "tier": 1,
+    "git_uri": ""
+  },
+  {
+    "name": "grail-test-svc-005",
+    "tier": 2,
+    "git_uri": ""
+  },
+  {
+    "name": "grail-test-svc-028",
+    "tier": 0,
+    "git_uri": ""
+  },
+  {
+    "name": "grail-test-svc-026",
+    "tier": 1,
+    "git_uri": ""
+  },
+  {
+    "name": "grail-test-svc-025",
+    "tier": 0,
+    "git_uri": ""
+  },
+  {
+    "name": "grail-test-svc-018",
+    "tier": 2,
+    "git_uri": ""
+  },
+  {
+    "name": "grail-test-svc-022",
+    "tier": 1,
+    "git_uri": ""
+  }
+]

@@ -1,0 +1,25 @@
+uber::service:* (
+  EXCLUDE __id
+  # Remove "uber::service:" prefix from __id to form the service name.
+  FIELD substr(__id, 14, len(__id)) AS name
+  FIELD config::Config.tier AS tier
+  # If a service does not have a tier it is either inactive, stale, or simply invalid. In either
+  # case it is not interesting to our analysis.
+  WHERE tier != null
+  WHERE config::Config.git.uri == "{{GIT_URI}}"
+  ORDER BY __id
+
+  SCAN up::environment as environments (
+    EXCLUDE __id
+    WHERE slm::Environment.type="ENVIRONMENT_TYPE_PROD"
+
+    SCAN up::addon as addons (
+      EXCLUDE __id
+      WHERE slm::Addon.type = "compute"
+      WHERE slm::Addon.compute_goal_state.total_min_capacity > 0
+    )
+    WHERE addons
+  )
+  WHERE environments
+  EXCLUDE environments
+)

@@ -1,0 +1,24 @@
+# keep
+load("@io_bazel_rules_go//go:def.bzl", "go_library", "go_test")
+
+go_library(
+    name = "go_default_library",
+    srcs = ["grail.go"],
+    embedsrcs = [
+        "query_active_go.txt",
+        "query_all.txt",
+        "query_namespace_burst_strategy.txt",
+        "query_network_group.txt",
+    ],
+    importpath = "github.com/uber-research/rpcshield/go/grail",
+    visibility = ["//visibility:public"],
+    deps = ["@org_uber_go_zap//:go_default_library"],
+)
+
+go_test(
+    name = "go_default_test",
+    srcs = ["grail_test.go"],
+    data = glob(["testdata/**"]),
+    embed = [":go_default_library"],
+    deps = ["@com_github_stretchr_testify//require:go_default_library"],
+)

@@ -1,0 +1,27 @@
+# keep
+load("@io_bazel_rules_go//go:def.bzl", "go_binary", "go_library", "go_path")
+
+go_library(
+    name = "go_default_library",
+    srcs = [
+        "app.go",
+        "permutations.go",
+    ],
+    importpath = "github.com/uber-research/rpcshield/go/exampleapps/errreturns",
+    visibility = ["//visibility:public"],
+)
+
+go_binary(
+    name = "errreturns",
+    embed = [":go_default_library"],
+    visibility = ["//visibility:public"],
+)
+
+# rpcshield (github.com/uber-research/rpcshield/go) uses this example as test input.
+go_path(
+    name = "errreturns-anal",
+    testonly = True,
+    include_data = False,
+    visibility = ["//staticanalyzer/ssaanal:__subpackages__"],
+    deps = [":errreturns"],
+)

@@ -1,0 +1,5 @@
+syntax = "proto3";
+
+package uber.config.llc;
+
+option go_package = "llcpb";

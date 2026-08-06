@@ -1,0 +1,15 @@
+load("@io_bazel_rules_go//go:def.bzl", "go_library")
+
+# keep
+go_library(
+    name = "go_default_library",
+    srcs = ["client.go"],
+    importpath = "thriftrw/simpleservice/simpleservicetest",
+    visibility = ["//visibility:public"],
+    deps = [
+        "//exampleapps/rpcshielddemo/genthrift/simpleservice:go_default_library",
+        "//exampleapps/rpcshielddemo/genthrift/simpleservice/simpleserviceclient:go_default_library",
+        "@com_github_golang_mock//gomock:go_default_library",
+        "@org_uber_go_yarpc//:go_default_library",
+    ],
+)

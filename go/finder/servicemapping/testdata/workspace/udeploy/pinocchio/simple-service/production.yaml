@@ -1,0 +1,9 @@
+schema_version: 2.0.0
+service_name: simple-service
+service_type: go_standard
+go_standard:
+  bazel_targets:
+    - //src/example.internal/plainone/cmd/plainone:plainone
+env_vars:
+  - name: UBER_CONFIG_DIR
+    value: "src/example.internal/plainone/config/api"

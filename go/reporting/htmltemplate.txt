@@ -1,0 +1,242 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>RPCShield Report for '{{.Service}}'</title>
+    <style>
+        body {
+            font-family: Arial, sans-serif;
+            margin: 20px;
+            line-height: 1.6;
+        }
+        .service-header {
+            margin-bottom: 20px;
+            padding: 10px;
+            border-bottom: 2px solid #ccc;
+        }
+        .metadata {
+            font-size: 0.9em;
+            color: #555;
+            margin-top: 5px;
+        }
+        .metadata span {
+            display: inline-block;
+            margin-right: 20px;
+        }
+        .service-report {
+            margin-bottom: 40px;
+            border: 1px solid #ccc;
+            padding: 20px;
+            border-radius: 8px;
+        }
+        .report-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 10px;
+        }
+        .report-header h3 {
+            margin: 0;
+            font-size: 1.5em;
+        }
+        .status-badge {
+            background-color: #d9534f; /* Red background for FailClose */
+            color: white;
+            font-weight: bold;
+            padding: 5px 15px;
+            border-radius: 8px;
+            font-size: 1.2em;
+            text-align: center;
+        }
+        .status-badge.success {
+            background-color: #5cb85c; /* Green background for FailOpen */
+        }
+        .status-badge.unknown {
+            background-color: #ffaa33; /* Orange background for FailUnknown and FailUnknownWithError */
+        }
+        .quadruple {
+            background-color: #f9f9f9;
+            padding: 15px;
+            border-radius: 8px;
+            margin-bottom: 20px;
+        }
+        table {
+            width: 100%;
+            border-collapse: collapse;
+            max-width: fit-content;
+            overflow-wrap: anywhere;
+        }
+        th, td {
+            border: 1px solid #ccc;
+            padding: 10px;
+            text-align: left;
+            overflow-wrap: anywhere;
+        }
+        th {
+            background-color: #f0f0f0;
+        }
+        .diagnostics_cell {
+            overflow: auto;
+            max-width: 400px;
+            max-height: 200px;
+            display: block;
+        }
+        .call-path {
+            margin-bottom: 30px;
+        }
+        .summary-row {
+            background-color: #f8f8f8;
+            font-weight: bold;
+        }
+        .path-status {
+            font-weight: bold;
+        }
+        .path-status.fail {
+            color: #d9534f; /* Red for FailClose */
+        }
+        .path-status.success {
+            color: #5cb85c; /* Green for FailOpen */
+        }
+        .path-status.unknown {
+            color: #ffaa33; /* Orange for FailUnknown and FailUnknownWithError */
+        }
+        .flamegraph-container {
+            margin: 20px 0;
+            border: 1px solid #ccc;
+            border-radius: 8px;
+            overflow-x: auto; /* In case the SVG is very wide */
+            padding: 10px;
+        }
+
+        .flamegraph-container svg {
+            display: block;    /* So it respects container width */
+            width: 100%;       /* Scale SVG to the container’s width */
+            height: auto;      /* Maintain aspect ratio */
+        }
+    </style>
+</head>
+<body>
+    <div class="service-header">
+        <h1>RPCShield Report for Service '{{.Service}}'</h1>
+        <div class="metadata">
+            <span><strong>Git SHA:</strong> {{.GitSHA}}</span>
+            <span><strong>Run Timestamp:</strong> {{.RunTimestamp}}</span>
+            <span><label><input type="checkbox" id="toggleDiagnosticMsg"> Show/Hide Diagnostic Msg</label></span>
+        </div>
+    </div>
+
+    {{range $quadrupleIndex, $report := .Reports}}
+    <div class="service-report" id="{{$report.ID}}">
+        <div class="report-header">
+            <h3>Report for Quadruple {{$quadrupleIndex | add 1}} of {{len $.Reports}} <span style="color: #A00000;">(ID: {{$report.ID}})</span></h3>
+            <span class="status-badge
+                {{if eq $report.Status "FailOpen"}}success
+                {{else if or (eq $report.Status "FailUnknown") (eq $report.Status "FailUnknownWithError")}}unknown
+                {{else if eq $report.Status "FailCloseSuppressed"}}success
+                {{else}}fail{{end}}">
+                {{$report.Status}}
+            </span>
+        </div>
+        <div class="quadruple">
+            <table>
+                <thead>
+                    <tr>
+                        <th>Inbound</th>
+                        <th>Outbound</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    <tr>
+                        <td>
+                            <strong>Service Name:</strong> <a href="https://up.uberinternal.com/s/{{$report.Inbound.Service.Name}}" target="_blank">{{$report.Inbound.Service.Name}}</a><br>
+                            <strong>Service Tier:</strong> {{$report.Inbound.Service.Tier}}<br>
+                            <strong>API Name:</strong> {{$report.Inbound.APIName}}
+                        </td>
+                        <td>
+                            <strong>Service Name:</strong> <a href="https://up.uberinternal.com/s/{{$report.Outbound.Service.Name}}" target="_blank">{{$report.Outbound.Service.Name}}</a><br>
+                            <strong>Service Tier:</strong> {{$report.Outbound.Service.Tier}}<br>
+                            <strong>API Name:</strong> {{$report.Outbound.APIName}}<br>
+                            <strong>Has Overcommit:</strong> {{$report.Outbound.Service.HasOvercommit}}<br>
+                            <strong>Break-Before-Make:</strong> {{$report.Outbound.Service.BreakBeforeMakeBurstStrategy}}<br>
+                            <strong>Make-Before-Break:</strong> {{$report.Outbound.Service.MakeBeforeBreakBurstStrategy}}
+                        </td>
+                    </tr>
+                </tbody>
+            </table>
+        </div>
+        <div class="flamegraph-container">
+            {{ $report.Flamegraph }}
+        </div>
+        <h4>Results of Call Paths between the Quadruple. Total paths: {{$report.TotalPaths}}.
+            {{if gt $report.TotalPaths (len $report.PathResults)}}
+                Showing only selected {{len $report.PathResults}} paths below.
+            {{else}}
+                Showing all {{len $report.PathResults}} paths below.
+            {{end}}
+        </h4>
+        {{range $pathIndex, $path := $report.PathResults}}
+        <div class="call-path">
+            <h4>Path {{$pathIndex | add 1}} of {{len $report.PathResults}}: (Outbound to Inbound)</h4>
+            <table>
+                <thead>
+                    <tr>
+                        <th>Caller</th>
+                        <th>Callee</th>
+                        <th>Source Code Link</th>
+                        <th>Fail-ness Status</th>
+                        <th>Analyzer</th>
+                        <!-- th>LastModify</th -->
+                        <th class="diagnostics_cell" style="display:none">Diagnostic Message</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    {{range .Edges}}
+                    <tr>
+                        <td>{{.Caller}}</td>
+                        <td>{{.Callee}}</td>
+                        <td>
+                            {{if ne .SourceGraphLink ""}}
+                                <a href="{{.SourceGraphLink}}" target="_blank">View Source</a>
+                            {{else}}
+                                N/A
+                            {{end}}
+                        </td>
+                        <td>{{.AnalyzerOutput.Status}}</td>
+                        {{if ne .AnalyzerOutput.Source .AnalyzerOutput.OriginalSource}}
+                            <td>{{.AnalyzerOutput.Source}}_{{.AnalyzerOutput.OriginalSource}}</td>
+                        {{else}}
+                            <td>{{.AnalyzerOutput.Source}}</td>
+                        {{end}}
+                        <!-- td>{{.CallerLastModifiedTimestamp}}</td -->
+                        <td class="diagnostics_cell" style="display:none">{{.AnalyzerOutput.DiagnosticMsg}}</td>
+                    </tr>
+                    {{end}}
+                    <tr class="summary-row">
+                        <td colspan="4">Overall Path Fail-ness Status</td>
+                        <td>
+                            <span class="path-status
+                                {{if eq $path.Status "FailOpen"}}success
+                                {{else if or (eq $path.Status "FailUnknown") (eq $path.Status "FailUnknownWithError")}}unknown
+                                {{else if eq $path.Status "FailCloseSuppressed"}}success
+                                {{else}}fail{{end}}">
+                                {{$path.Status}}
+                            </span>
+                        </td>
+                    </tr>
+                </tbody>
+            </table>
+        </div>
+        {{end}}
+    </div>
+    {{end}}
+<script>
+    const toggleableCells = document.querySelectorAll('.diagnostics_cell');
+    document.getElementById('toggleDiagnosticMsg').addEventListener('change', function() {
+      toggleableCells.forEach(column => {
+        column.style.display = this.checked ? '' : 'none';
+      });
+    });
+</script>
+</body>
+</html>

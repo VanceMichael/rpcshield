@@ -1,0 +1,53 @@
+# keep
+load("@io_bazel_rules_go//go:def.bzl", "go_library", "go_test")
+
+go_library(
+    name = "go_default_library",
+    srcs = [
+        "callgraph.go",
+        "dedup.go",
+        "fingerprint.go",
+        "methodvalue.go",
+        "pmap.go",
+        "workerpool.go",
+    ],
+    importpath = "github.com/uber-research/rpcshield/go/rta/utils",
+    visibility = ["//visibility:public"],
+    deps = [
+        "//common/chaselev:go_default_library",
+        "@com_github_puzpuzpuz_xsync_v4//:go_default_library",
+        "@org_golang_x_tools//go/callgraph:go_default_library",
+        "@org_golang_x_tools//go/ssa:go_default_library",
+        "@org_golang_x_tools//go/types/typeutil:go_default_library",
+    ],
+)
+
+go_test(
+    name = "go_default_test",
+    # `methodvalue_concurrent_test.go` builds a (small) SSA program per
+    # invocation and races wrapper synthesis across goroutines. Under
+    # CI's --runs_per_test=300, hundreds of copies of this binary share
+    # the host; the steady-state run is well under a second but a single
+    # contended run can occasionally stretch past the medium-size
+    # default (5 min). `timeout = "long"` keeps the medium scheduling
+    # class (parallel test slots unchanged) and only extends the per-run
+    # deadline to 15 min.
+    timeout = "long",
+    srcs = [
+        "callgraph_test.go",
+        "dedup_test.go",
+        "fingerprint_test.go",
+        "methodvalue_concurrent_test.go",
+        "methodvalue_test.go",
+        "pmap_test.go",
+        "workerpool_test.go",
+    ],
+    embed = [":go_default_library"],
+    deps = [
+        "@com_github_puzpuzpuz_xsync_v4//:go_default_library",
+        "@com_github_stretchr_testify//require:go_default_library",
+        "@org_golang_x_tools//go/callgraph:go_default_library",
+        "@org_golang_x_tools//go/ssa:go_default_library",
+        "@org_golang_x_tools//go/types/typeutil:go_default_library",
+    ],
+)

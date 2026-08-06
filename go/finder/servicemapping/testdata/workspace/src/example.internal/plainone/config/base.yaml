@@ -1,0 +1,6 @@
+yarpc:
+  outbounds:
+    service-0046-alias:
+      service: service-0047
+      tchannel:
+        with: muttley
