@@ -289,6 +289,17 @@ func (f *Finder) serverInterfaces(allPkgs []*packages.Package) (map[*types.Inter
 			if !ok {
 				continue
 			}
+			if iface.NumMethods() == 0 {
+				// Empty IDL service definitions (`service Foo {}` in a .thrift
+				// file, or a .proto with no rpc entries) generate zero-method
+				// Go interfaces. Every type trivially satisfies types.Implements
+				// for them, so accepting one here would flood implStructs with
+				// meaningless matches and later panic at inbound.go's
+				// impl.iface.Method(0) call when deriving the canonical service
+				// name. An IDL with no RPC entries has no endpoints to detect.
+				f.logger.Debugw("Skipping zero-method server interface", "interface", qualifiedName, "type", endpointType, "in", pkg.PkgPath)
+				continue
+			}
 			f.logger.Debugw("Found server interface", "interface", qualifiedName, "type", endpointType, "in", pkg.PkgPath)
 			ifaces[qualifiedName] = ifaceEntry{iface: iface, endpointType: endpointType}
 		}
