@@ -311,6 +311,10 @@ func (d *Driver) Run(ctx context.Context, serviceName string) (result Result, er
 		// Overwrite the result status if there was an error.
 		if err != nil {
 			result.Status = Error
+			// Populate the error message on the result *before* it is encoded below, so it
+			// actually makes it into the persisted result.json instead of only being set on
+			// the in-memory copy after the file has already been written.
+			result.ErrorMsg = err.Error()
 		}
 		// Write result to the output directory for debugging purposes.
 		f, fOpenError := os.Create(filepath.Join(d.opts.OutputDir, fmt.Sprintf("%s_result.json", serviceName)))
