@@ -12,6 +12,16 @@ func pingHandler(w http.ResponseWriter, r *http.Request) {
 	w.Write([]byte("Ping"))
 }
 
+// notify has a non-handler signature, so it never resolves to a handler.
+func notify() {}
+
+// wrapNotify mirrors gin.WrapF(pprof.Index): its argument parses fine as a
+// function object but is not a handler, so the wrapping call yields candidates
+// that are all empty and the parser must fall through instead of erroring.
+func wrapNotify(f func()) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { f() })
+}
+
 // group holds the route-registration methods. It mirrors real frameworks (e.g.
 // gin, whose verb methods live on an embedded *gin.RouterGroup) where the
 // registration methods are promoted from an embedded sub-struct. A call on the
@@ -49,6 +59,10 @@ func setupRoutes() *router {
 	// Interface-boxed handler -> exercises the ssa.MakeInterface case in the
 	// handler parser (http.HandlerFunc(fn) boxed to http.Handler).
 	r.Handle("/boxed", http.HandlerFunc(pingHandler))
+
+	// Wrapped non-handler argument -> exercises the fall-through to the
+	// "call itself makes a handler" heuristic when every candidate is empty.
+	r.Handle("/wrapped", wrapNotify(notify))
 
 	return r
 }
