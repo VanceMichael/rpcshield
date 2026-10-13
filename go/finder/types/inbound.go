@@ -52,20 +52,3 @@ func (i InboundPoint) toRepr() inboundPointRepr {
 func (i InboundPoint) MarshalJSON() ([]byte, error) {
 	return json.Marshal(i.toRepr())
 }
-
-// MergeInboundPoints merges two slices of InboundPoint with deduplication.
-func MergeInboundPoints(a, b []InboundPoint) []InboundPoint {
-	seen := make(map[inboundPointRepr]bool, len(a)+len(b))
-	merged := make([]InboundPoint, 0, len(a)+len(b))
-	for _, points := range [2][]InboundPoint{a, b} {
-		for _, p := range points {
-			repr := p.toRepr()
-			if !seen[repr] {
-				merged = append(merged, p)
-			}
-			seen[repr] = true
-		}
-	}
-
-	return merged
-}
