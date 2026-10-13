@@ -33,6 +33,17 @@ func (br *gopathWrapper) fixImportComment(runner utils.Runner, gopathRoot string
 
 	// Walk through all .go files in the gopath
 	err := filepath.WalkDir(gopathRoot, func(path string, d fs.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		// go_path's generated tree can contain a directory whose name happens to end in
+		// ".go" (e.g. when a genrule/embedsrcs output collides with a package directory
+		// name), so a suffix check alone isn't enough to tell us this is a readable Go
+		// source file; os.ReadFile on a directory fails with "is a directory" and aborts
+		// the whole walk. Skip directories explicitly.
+		if d.IsDir() {
+			return nil
+		}
 		if !strings.HasSuffix(path, ".go") {
 			return nil
 		}
