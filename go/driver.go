@@ -427,6 +427,13 @@ func (d *Driver) Run(ctx context.Context, serviceName string) (result Result, er
 	start = time.Now()
 	pathCache := make(map[string]bool)
 	for tidx, target := range targets {
+		// Service configs occasionally list bare-workspace target labels (pkg/path:name)
+		// without the //-prefix. Bazel interprets bare labels relative to the process cwd,
+		// which for rpcshield is generally not the workspace root -- so any downstream
+		// `bazel query deps(pkg/foo:bar)` resolves against the wrong parent directory and
+		// fails with "no such package". Canonicalize once here so every downstream helper
+		// sees the same //-prefixed form and cwd doesn't matter.
+		target = canonicalizeLabel(target)
 		d.Logger.Info("target", tidx, " : ", target)
 
 		var pkgs []*packages.Package
@@ -1823,6 +1830,24 @@ func getMaxUsedDram() (int64, error) {
 		return 0, fmt.Errorf("failed to get resource usage: %w", err)
 	}
 	return rusage.Maxrss, nil
+}
+
+// canonicalizeLabel normalizes a Bazel target label to its fully-qualified form so downstream
+// `bazel query`/`cquery` invocations resolve it against the workspace root regardless of the
+// process cwd. `//pkg` becomes `//pkg:pkg`, `@repo//pkg` becomes `@repo//pkg:pkg`, and bare
+// workspace-root labels (`pkg/path:name` or `pkg/path`) get the `//` prefix, so both writing
+// styles round-trip to canonical form.
+func canonicalizeLabel(label string) string {
+	if !strings.HasPrefix(label, "//") && !strings.HasPrefix(label, "@") {
+		label = "//" + label
+	}
+	if strings.Contains(label, ":") {
+		return label
+	}
+	if idx := strings.LastIndex(label, "/"); idx >= 0 {
+		return label + ":" + label[idx+1:]
+	}
+	return label
 }
 
 func useBazelLoader(serviceName string, bazelLoaderServices []string) bool {
