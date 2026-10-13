@@ -89,7 +89,7 @@ func (br *gopathWrapper) LiftGoPath(runner utils.Runner, target string) (string,
 	targetName := pkgAndTgt[1]
 	goPathTgtName := targetName + "-anal"
 	tgtWithPkg := "//" + pkgPath + ":__pkg__"
-	buildFile := filepath.Join(pkgPath, "BUILD.bazel")
+	buildFile := filepath.Join(br.Workspace, pkgPath, "BUILD.bazel")
 	// Read the content of the BUILD.bazel file.
 	data, err := os.ReadFile(buildFile)
 	if err != nil {
