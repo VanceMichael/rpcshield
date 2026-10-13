@@ -9,6 +9,7 @@ import (
 	"github.com/stretchr/testify/require"
 	"github.com/uber-research/rpcshield/go/rpcshieldtest"
 	"go.uber.org/zap"
+	"golang.org/x/tools/go/packages"
 )
 
 func TestFindCodebasePkgs(t *testing.T) {
@@ -51,4 +52,103 @@ func goSDKBinDir() string {
 func fileExists(path string) bool {
 	_, err := os.Stat(path)
 	return err == nil
+}
+
+func TestDedupPackages(t *testing.T) {
+	t.Parallel()
+
+	const (
+		fooPath = "code.uber.internal/example/foo"
+		barPath = "code.uber.internal/example/bar"
+	)
+
+	tests := []struct {
+		name    string
+		pkgs    []*packages.Package
+		wantIDs []string
+		wantErr string
+	}{
+		{
+			name: "distinct packages are all kept",
+			pkgs: []*packages.Package{
+				{ID: "//example/foo:go_default_library", PkgPath: fooPath},
+				{ID: "//example/bar:go_default_library", PkgPath: barPath},
+			},
+			wantIDs: []string{"//example/foo:go_default_library", "//example/bar:go_default_library"},
+		},
+		{
+			name: "canonical target replaces an already-seen variant",
+			pkgs: []*packages.Package{
+				{ID: "//example/foo:sdui_trampoline_library", PkgPath: fooPath},
+				{ID: "//example/foo:go_default_library", PkgPath: fooPath},
+			},
+			wantIDs: []string{"//example/foo:go_default_library"},
+		},
+		{
+			name: "already-seen canonical target wins over a later variant",
+			pkgs: []*packages.Package{
+				{ID: "//example/foo:go_default_binary", PkgPath: fooPath},
+				{ID: "//example/foo:sdui_trampoline_library", PkgPath: fooPath},
+			},
+			wantIDs: []string{"//example/foo:go_default_binary"},
+		},
+		{
+			name: "two non-canonical duplicates are a genuine error",
+			pkgs: []*packages.Package{
+				{ID: "//example/foo:variant_a", PkgPath: fooPath},
+				{ID: "//example/foo:variant_b", PkgPath: fooPath},
+			},
+			wantErr: `duplicate package found: "code.uber.internal/example/foo" (//example/foo:variant_a vs //example/foo:variant_b)`,
+		},
+		{
+			name: "two canonical duplicates are a genuine error",
+			pkgs: []*packages.Package{
+				{ID: "//example/foo:go_default_library", PkgPath: fooPath},
+				{ID: "//other/foo:go_default_library", PkgPath: fooPath},
+			},
+			wantErr: `duplicate package found: "code.uber.internal/example/foo"`,
+		},
+		{
+			name: "non-_go_proto variant replaces already-seen _go_proto variant",
+			pkgs: []*packages.Package{
+				{ID: "//example/foo:foo_go_proto", PkgPath: fooPath},
+				{ID: "//example/foo:foo", PkgPath: fooPath},
+			},
+			wantIDs: []string{"//example/foo:foo"},
+		},
+		{
+			name: "already-seen non-_go_proto variant wins over a later _go_proto variant",
+			pkgs: []*packages.Package{
+				{ID: "//example/foo:foo", PkgPath: fooPath},
+				{ID: "//example/foo:foo_go_proto", PkgPath: fooPath},
+			},
+			wantIDs: []string{"//example/foo:foo"},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			deduped, pkgMap, err := DedupPackages(zap.NewNop().Sugar(), tt.pkgs)
+			if tt.wantErr != "" {
+				require.ErrorContains(t, err, tt.wantErr)
+				require.Nil(t, deduped)
+				require.Nil(t, pkgMap)
+				return
+			}
+			require.NoError(t, err)
+
+			gotIDs := make([]string, 0, len(deduped))
+			for _, pkg := range deduped {
+				gotIDs = append(gotIDs, pkg.ID)
+			}
+			require.Equal(t, tt.wantIDs, gotIDs)
+
+			require.Len(t, pkgMap, len(tt.wantIDs))
+			for _, pkg := range deduped {
+				require.Same(t, pkg, pkgMap[pkg.PkgPath])
+			}
+		})
+	}
 }
