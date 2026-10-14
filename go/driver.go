@@ -621,7 +621,7 @@ func (d *Driver) Run(ctx context.Context, serviceName string) (result Result, er
 		}
 
 		result.FilteredOutbounds = fty.MergeOutboundPoints(result.FilteredOutbounds, outbounds)
-		result.RunMetrics[_filteredOutboundCount] += float64(len(result.FilteredOutbounds))
+		result.RunMetrics[_filteredOutboundCount] += float64(len(outbounds))
 
 		// Continue to the next target if there are no outbound points after filtering.
 		// Note that we do not actually fail the entire run since it is possible that some targets
