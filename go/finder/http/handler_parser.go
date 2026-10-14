@@ -61,6 +61,7 @@ func (p *HandlerParser) ParseHandleFuncs(val ssa.Value) ([]handler, error) {
 		// resemble handler functions (i.e., have signatures matching http.HandlerFunc).
 
 		var candidates []([]handler)
+		totalHandlers := 0
 		for _, arg := range x.Call.Args {
 			funcs, err := p.ParseHandleFuncs(arg)
 			if err != nil {
@@ -68,13 +69,20 @@ func (p *HandlerParser) ParseHandleFuncs(val ssa.Value) ([]handler, error) {
 				continue
 			}
 			candidates = append(candidates, funcs)
+			totalHandlers += len(funcs)
 		}
 
-		if len(candidates) == 1 {
+		// Only trust the candidates if at least one of them actually
+		// resolved to a real handler. If every candidate came back empty
+		// (e.g. gin.WrapF(pprof.Index): pprof.Index parses fine as a
+		// function object but its signature isn't a gin handler), fall
+		// through to the "call itself makes a handler" heuristic below
+		// instead of silently reporting zero handlers.
+		if len(candidates) == 1 && totalHandlers > 0 {
 			return candidates[0], nil
 		}
 
-		if len(candidates) == 0 {
+		if totalHandlers == 0 {
 			// This could be a function call that _makes_ handler funcs
 			// Use a heuristic to extract the handler func that is created
 			//
@@ -112,6 +120,14 @@ func (p *HandlerParser) ParseHandleFuncs(val ssa.Value) ([]handler, error) {
 						}
 					}
 				}
+			}
+
+			// Heuristic didn't apply or failed -- preserve prior behavior for
+			// the case where every candidate came back empty (all are
+			// equivalent to nil here since totalHandlers == 0) rather than
+			// turning it into a hard error.
+			if len(candidates) > 0 {
+				return candidates[0], nil
 			}
 		}
 
