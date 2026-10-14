@@ -558,7 +558,7 @@ func (d *Driver) Run(ctx context.Context, serviceName string) (result Result, er
 			return result, fmt.Errorf("find inbound: %w", err)
 		}
 		d.Logger.Infow("Found inbound functions", "num_functions", len(inbounds))
-		result.Inbounds = fty.MergeInboundPoints(result.Inbounds, inbounds)
+		result.Inbounds = append(result.Inbounds, inbounds...)
 		result.RunMetrics[_inboundCount] += float64(len(inbounds))
 
 		// Early exit for CG construction-only eval bench
@@ -593,7 +593,7 @@ func (d *Driver) Run(ctx context.Context, serviceName string) (result Result, er
 			result.RunMetrics[_outboundCountBeforeFilterPrefix+string(k)] += v
 		}
 
-		result.Outbounds = fty.MergeOutboundPoints(result.Outbounds, outbounds)
+		result.Outbounds = append(result.Outbounds, outbounds...)
 		result.RunMetrics[_outboundCount] += float64(len(outbounds))
 		result.RunMetrics[_ibObDetectionDurationSecs] += time.Now().Sub(start).Seconds()
 
@@ -620,7 +620,7 @@ func (d *Driver) Run(ctx context.Context, serviceName string) (result Result, er
 
 		}
 
-		result.FilteredOutbounds = fty.MergeOutboundPoints(result.FilteredOutbounds, outbounds)
+		result.FilteredOutbounds = append(result.FilteredOutbounds, outbounds...)
 		result.RunMetrics[_filteredOutboundCount] += float64(len(outbounds))
 
 		// Continue to the next target if there are no outbound points after filtering.

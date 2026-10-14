@@ -49,19 +49,3 @@ func (o OutboundPoint) toRepr() outboundPointRepr {
 func (o OutboundPoint) MarshalJSON() ([]byte, error) {
 	return json.Marshal(o.toRepr())
 }
-
-// MergeOutboundPoints merges two slices of OutboundPoint with deduplication.
-func MergeOutboundPoints(a, b []OutboundPoint) []OutboundPoint {
-	seen := make(map[outboundPointRepr]bool, len(a)+len(b))
-	merged := make([]OutboundPoint, 0, len(a)+len(b))
-	for _, points := range [2][]OutboundPoint{a, b} {
-		for _, p := range points {
-			repr := p.toRepr()
-			if !seen[repr] {
-				merged = append(merged, p)
-			}
-			seen[repr] = true
-		}
-	}
-	return merged
-}

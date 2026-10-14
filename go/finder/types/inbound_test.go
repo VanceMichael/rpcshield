@@ -11,57 +11,6 @@ import (
 	"golang.org/x/tools/go/packages"
 )
 
-func TestMergeInboundPoints(t *testing.T) {
-	t.Parallel()
-
-	point1, point2, point3 := createTestInboundPoints(t)
-
-	tests := []struct {
-		name     string
-		a        []InboundPoint
-		b        []InboundPoint
-		expected []InboundPoint
-	}{
-		{
-			name:     "empty slices",
-			a:        []InboundPoint{},
-			b:        []InboundPoint{},
-			expected: []InboundPoint{},
-		},
-		{
-			name:     "one empty slice",
-			a:        []InboundPoint{point1},
-			b:        []InboundPoint{},
-			expected: []InboundPoint{point1},
-		},
-		{
-			name:     "no duplicates",
-			a:        []InboundPoint{point1},
-			b:        []InboundPoint{point2},
-			expected: []InboundPoint{point1, point2},
-		},
-		{
-			name:     "with duplicates",
-			a:        []InboundPoint{point1, point2},
-			b:        []InboundPoint{point1, point3},
-			expected: []InboundPoint{point1, point2, point3},
-		},
-		{
-			name:     "all duplicates",
-			a:        []InboundPoint{point1},
-			b:        []InboundPoint{point1},
-			expected: []InboundPoint{point1},
-		},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			result := MergeInboundPoints(tt.a, tt.b)
-			require.Equal(t, tt.expected, result)
-		})
-	}
-}
-
 func TestInboundPoint_MarshalJSON(t *testing.T) {
 	t.Parallel()
 
