@@ -2,6 +2,7 @@ package bazel
 
 import (
 	"bufio"
+	"context"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -134,17 +135,18 @@ type Attribute struct {
 //     ...
 // )
 
-func (br *gopathWrapper) processCGo(runner utils.Runner, target string, gopathRoot string) ([]string, error) {
+func (br *gopathWrapper) processCGo(ctx context.Context, runner utils.Runner, target string, gopathRoot string) ([]string, error) {
 	// Fetch all cc_library (C++) dependencies (direct and transitive) of target
 	br.Logger.Infow("processCGo", "target", target)
 
-	ccOut, _, err := utils.ExecCommand(runner, br.BazelPath, "query", "--output=label", fmt.Sprintf("kind(cc_library, deps(%s))", target))
+	ccOut, _, err := utils.ExecCommandContext(ctx, runner, br.BazelPath, "query", "--output=label", fmt.Sprintf("kind(cc_library, deps(%s))", target))
 	if err != nil {
 		return nil, err
 	}
 	ccLibs := strings.Split(strings.TrimSpace(string(ccOut)), "\n")
 	// Handle C/C++ library built as `go_library`
-	ccOutGoDeps, _, err := utils.ExecCommand(
+	ccOutGoDeps, _, err := utils.ExecCommandContext(
+		ctx,
 		runner,
 		br.BazelPath,
 		"query",
@@ -162,7 +164,7 @@ func (br *gopathWrapper) processCGo(runner utils.Runner, target string, gopathRo
 	clibFilesMap := make(map[string][]string)
 	clibSrcPathMap := make(map[string]string)
 	if len(goCLibs) > 0 {
-		ccLibs1, localClibFilesMap, localclibLocationPath, err := br.getDependentCLibs(runner, goCLibs)
+		ccLibs1, localClibFilesMap, localclibLocationPath, err := br.getDependentCLibs(ctx, runner, goCLibs)
 		if err != nil {
 			return nil, fmt.Errorf("failed to get lower c lib for: %w", err)
 		}
@@ -176,17 +178,21 @@ func (br *gopathWrapper) processCGo(runner utils.Runner, target string, gopathRo
 		if len(ccLib) == 0 {
 			continue
 		}
+		// Stop issuing new cquery/chmod work once canceled.
+		if err := ctx.Err(); err != nil {
+			return nil, fmt.Errorf("process cgo canceled: %w", err)
+		}
 		// Retrieve detailed build information about the cc_library target in JSON format.
-		resp, err := br.configQuery(runner, ccLib)
+		resp, err := br.configQuery(ctx, runner, ccLib)
 		if err != nil {
 			return nil, fmt.Errorf("failed to get cquery output for %s: %w", ccLib, err)
 		}
-		err = br.preProcessCgoPkgConfig(runner, ccLib, gopathRoot, clibFilesMap, clibSrcPathMap)
+		err = br.preProcessCgoPkgConfig(ctx, runner, ccLib, gopathRoot, clibFilesMap, clibSrcPathMap)
 		if err != nil {
 			return nil, fmt.Errorf("failed to preprocess cgo pkg-config for %s: %w", ccLib, err)
 		}
 
-		err = br.processCqueryResponse(runner, resp, &iFlagsSlice, iFlagDedup, gopathRoot)
+		err = br.processCqueryResponse(ctx, runner, resp, &iFlagsSlice, iFlagDedup, gopathRoot)
 		if err != nil {
 			return nil, fmt.Errorf("failed to process cquery response for %s: %w", ccLib, err)
 		}
@@ -221,7 +227,7 @@ func (br *gopathWrapper) processCGo(runner utils.Runner, target string, gopathRo
 //	visibility = ["//visibility:public"],
 //
 // )
-func (br *gopathWrapper) preProcessCgoPkgConfig(runner utils.Runner, ccLib, gopathRoot string, clibFilesMap map[string][]string, clibSrcPathMap map[string]string) error {
+func (br *gopathWrapper) preProcessCgoPkgConfig(ctx context.Context, runner utils.Runner, ccLib, gopathRoot string, clibFilesMap map[string][]string, clibSrcPathMap map[string]string) error {
 	srcsGoFiles, _ := clibFilesMap[ccLib]
 	clibSrcPath := clibSrcPathMap[ccLib]
 	// Remove cgo pkg-config lines.
@@ -247,7 +253,7 @@ func (br *gopathWrapper) preProcessCgoPkgConfig(runner utils.Runner, ccLib, gopa
 		// br.Logger.Debugw("clibSrcPath", "clibSrcPath", clibSrcPath)
 		// br.Logger.Debugw("importPath", "importPath", importPath)
 		// br.Logger.Debugw("srcGoFilePath", "srcGoFilePath", srcGoFilePath)
-		if _, _, err := utils.ExecCommand(runner, "chmod", "-R", "777", srcGoFile); err != nil {
+		if _, _, err := utils.ExecCommandContext(ctx, runner, "chmod", "-R", "777", srcGoFile); err != nil {
 			return fmt.Errorf("failed to make %q writable: %w", srcGoFile, err)
 		}
 		err = removeCgoPkgConfigLinesFromFile(srcGoFile)
@@ -258,7 +264,7 @@ func (br *gopathWrapper) preProcessCgoPkgConfig(runner utils.Runner, ccLib, gopa
 	return nil
 }
 
-func (br *gopathWrapper) getDependentCLibs(runner utils.Runner, goCLibs []string) ([]string, map[string][]string, map[string]string, error) {
+func (br *gopathWrapper) getDependentCLibs(ctx context.Context, runner utils.Runner, goCLibs []string) ([]string, map[string][]string, map[string]string, error) {
 	// Get all cc_library and corresponding source files and location path.
 	allclibs := make([]string, 0)
 	clibFilesMap := make(map[string][]string)
@@ -267,7 +273,7 @@ func (br *gopathWrapper) getDependentCLibs(runner utils.Runner, goCLibs []string
 		if goCLib == "" {
 			continue
 		}
-		resp, err := br.configQuery(runner, goCLib)
+		resp, err := br.configQuery(ctx, runner, goCLib)
 		if err != nil {
 			return nil, nil, nil, fmt.Errorf("failed to get cquery output for %s: %w", goCLib, err)
 		}
@@ -323,7 +329,7 @@ func (br *gopathWrapper) cqueryMine(runner utils.Runner, resp CqueryResponse) ([
 	return clibs, clibSrcGoFiles, clibLocationPath, nil
 }
 
-func (br *gopathWrapper) processCCLibrary(runner utils.Runner, rule Rule, libLocationPath string, iFlagsSlice *[]string, iFlagDedup map[string]bool, gopathRoot string) error {
+func (br *gopathWrapper) processCCLibrary(ctx context.Context, runner utils.Runner, rule Rule, libLocationPath string, iFlagsSlice *[]string, iFlagDedup map[string]bool, gopathRoot string) error {
 	br.Logger.Debugw("process cquery response cc_library", "clibName", rule.Name)
 	// To avoid order of the attributes, iterate N times.
 	for _, attr := range rule.Attributes {
@@ -355,7 +361,7 @@ func (br *gopathWrapper) processCCLibrary(runner utils.Runner, rule Rule, libLoc
 			// Copy the raw cc_library source/header files explicitly to the lifted path location.
 			// This is required because `bazel build --remote_download_all` does not download the raw cc_library files.
 			if isRawSrcsOrHdrs(attr) {
-				depPath, err := br.copySrcHdrFiles(runner, libLocationPath, gopathRoot, includePrefix)
+				depPath, err := br.copySrcHdrFiles(ctx, runner, libLocationPath, gopathRoot, includePrefix)
 				if err != nil {
 					return fmt.Errorf("copySrcHdrFiles fail: %w", err)
 				}
@@ -370,7 +376,7 @@ func (br *gopathWrapper) processCCLibrary(runner utils.Runner, rule Rule, libLoc
 		}
 	} else {
 		//Handle external CGO-cc_library
-		err := br.extractBazelGenIncPath(runner, rule, iFlagsSlice, iFlagDedup, gopathRoot, includePrefix)
+		err := br.extractBazelGenIncPath(ctx, runner, rule, iFlagsSlice, iFlagDedup, gopathRoot, includePrefix)
 		if err != nil {
 			return fmt.Errorf("failed to extract bazel gen inc path: %w", err)
 		}
@@ -378,17 +384,17 @@ func (br *gopathWrapper) processCCLibrary(runner utils.Runner, rule Rule, libLoc
 	return nil
 }
 
-func (br *gopathWrapper) extractBazelGenIncPath(runner utils.Runner, rule Rule, iFlagsSlice *[]string, iFlagDedup map[string]bool, gopathRoot, includePrefix string) error {
+func (br *gopathWrapper) extractBazelGenIncPath(ctx context.Context, runner utils.Runner, rule Rule, iFlagsSlice *[]string, iFlagDedup map[string]bool, gopathRoot, includePrefix string) error {
 	// To generate necessary header files via parsing bazel build output
 	// 1. build external target
-	_, _, err := utils.ExecCommand(runner, br.BazelPath, "build", rule.Name)
+	_, _, err := utils.ExecCommandContext(ctx, runner, br.BazelPath, "build", rule.Name)
 	if err != nil {
 		return err
 	}
 	// 2. parse bazel build output
 	// The output is a list of files generated by the build
 	// Example: {bazel-out/k8-fastbuild/bin/external/libpostal/libscanner.a\nbazel-out/k8-fastbuild/bin/external/libpostal/libscanner.so\n}
-	outlist, _, err := utils.ExecCommand(runner, br.BazelPath, "cquery", rule.Name, "--output=starlark",
+	outlist, _, err := utils.ExecCommandContext(ctx, runner, br.BazelPath, "cquery", rule.Name, "--output=starlark",
 		`--starlark:expr="\n".join([f.path for f in target.files.to_list()])`)
 	if err != nil {
 		return err
@@ -409,7 +415,7 @@ func (br *gopathWrapper) extractBazelGenIncPath(runner utils.Runner, rule Rule, 
 			genIncPath[out] = 0 // if out is target, use the target path, all the files are in the target path.
 		}
 	}
-	bazelOutPath, _, err := utils.ExecCommand(runner, br.BazelPath, "info", "output_path")
+	bazelOutPath, _, err := utils.ExecCommandContext(ctx, runner, br.BazelPath, "info", "output_path")
 	if err != nil {
 		return err
 	}
@@ -449,7 +455,7 @@ func (br *gopathWrapper) extractBazelGenIncPath(runner utils.Runner, rule Rule, 
 	return nil
 }
 
-func (br *gopathWrapper) processCMake(runner utils.Runner, rule Rule, iFlagsSlice *[]string, iFlagDedup map[string]bool, gopathRoot string) error {
+func (br *gopathWrapper) processCMake(ctx context.Context, runner utils.Runner, rule Rule, iFlagsSlice *[]string, iFlagDedup map[string]bool, gopathRoot string) error {
 	br.Logger.Debugw("process cquery response using CMAKE", "clibName", rule.Name)
 	var includePrefix string
 	for _, attr := range rule.Attributes {
@@ -457,14 +463,14 @@ func (br *gopathWrapper) processCMake(runner utils.Runner, rule Rule, iFlagsSlic
 			includePrefix = attr.StringValue
 		}
 	}
-	err := br.extractBazelGenIncPath(runner, rule, iFlagsSlice, iFlagDedup, gopathRoot, includePrefix)
+	err := br.extractBazelGenIncPath(ctx, runner, rule, iFlagsSlice, iFlagDedup, gopathRoot, includePrefix)
 	if err != nil {
 		return fmt.Errorf("failed to extract bazel gen inc path: %w", err)
 	}
 	return nil
 }
 
-func (br *gopathWrapper) processConfigureMake(runner utils.Runner, rule Rule, iFlagsSlice *[]string, iFlagDedup map[string]bool, gopathRoot string) error {
+func (br *gopathWrapper) processConfigureMake(ctx context.Context, runner utils.Runner, rule Rule, iFlagsSlice *[]string, iFlagDedup map[string]bool, gopathRoot string) error {
 	br.Logger.Debugw("process cquery response using CONFIGURE", "clibName", rule.Name)
 	var includePrefix string
 	for _, attr := range rule.Attributes {
@@ -472,14 +478,14 @@ func (br *gopathWrapper) processConfigureMake(runner utils.Runner, rule Rule, iF
 			includePrefix = attr.StringValue
 		}
 	}
-	err := br.extractBazelGenIncPath(runner, rule, iFlagsSlice, iFlagDedup, gopathRoot, includePrefix)
+	err := br.extractBazelGenIncPath(ctx, runner, rule, iFlagsSlice, iFlagDedup, gopathRoot, includePrefix)
 	if err != nil {
 		return fmt.Errorf("failed to extract bazel gen inc path: %w", err)
 	}
 	return nil
 }
 
-func (br *gopathWrapper) processCqueryResponse(runner utils.Runner, resp CqueryResponse, iFlagsSlice *[]string, iFlagDedup map[string]bool, gopathRoot string) error {
+func (br *gopathWrapper) processCqueryResponse(ctx context.Context, runner utils.Runner, resp CqueryResponse, iFlagsSlice *[]string, iFlagDedup map[string]bool, gopathRoot string) error {
 	// Iterate over each of the results and process the cquery response.
 	for _, r := range resp.Results {
 		rule := r.Target.Rule
@@ -496,19 +502,19 @@ func (br *gopathWrapper) processCqueryResponse(runner utils.Runner, resp CqueryR
 			if strings.Contains(rule.Name, "@bazel_tools//") {
 				continue
 			}
-			err := br.processCCLibrary(runner, rule, libLocationPath, iFlagsSlice, iFlagDedup, gopathRoot)
+			err := br.processCCLibrary(ctx, runner, rule, libLocationPath, iFlagsSlice, iFlagDedup, gopathRoot)
 			if err != nil {
 				br.Logger.Errorf("failed to process cc_library: %w", err)
 				return err
 			}
 		case "cmake":
-			err := br.processCMake(runner, rule, iFlagsSlice, iFlagDedup, gopathRoot)
+			err := br.processCMake(ctx, runner, rule, iFlagsSlice, iFlagDedup, gopathRoot)
 			if err != nil {
 				br.Logger.Errorf("failed to process cmake: %w", err)
 				return err
 			}
 		case "configure_make":
-			err := br.processConfigureMake(runner, rule, iFlagsSlice, iFlagDedup, gopathRoot)
+			err := br.processConfigureMake(ctx, runner, rule, iFlagsSlice, iFlagDedup, gopathRoot)
 			if err != nil {
 				br.Logger.Errorf("failed to process configure: %w", err)
 				return err
@@ -520,11 +526,11 @@ func (br *gopathWrapper) processCqueryResponse(runner utils.Runner, resp CqueryR
 	return nil
 }
 
-func (br *gopathWrapper) configQuery(runner utils.Runner, ccLib string) (CqueryResponse, error) {
+func (br *gopathWrapper) configQuery(ctx context.Context, runner utils.Runner, ccLib string) (CqueryResponse, error) {
 	var resp CqueryResponse
 	// Retrieve detailed build information about the cc_library target in JSON format.
 	br.Logger.Debugw("run configQuery", "ccLib", ccLib)
-	ccLibInfo, _, err := utils.ExecCommand(runner, br.BazelPath, "cquery", "--output=jsonproto", fmt.Sprintf("%s", ccLib))
+	ccLibInfo, _, err := utils.ExecCommandContext(ctx, runner, br.BazelPath, "cquery", "--output=jsonproto", fmt.Sprintf("%s", ccLib))
 	if err != nil {
 		return resp, fmt.Errorf("failed to get cquery output for %s: %w", ccLib, err)
 	}
@@ -571,7 +577,7 @@ func getNormalizedIFlag(depRoot, flag string) (string, bool) {
 }
 
 // copySrcHdrFiles copies the raw cc_library rule to the lifted path location. It returns the path of the copied files and an error, if any.
-func (br *gopathWrapper) copySrcHdrFiles(runner utils.Runner, libLocationPath, gopathRoot, includePrefix string) (string, error) {
+func (br *gopathWrapper) copySrcHdrFiles(ctx context.Context, runner utils.Runner, libLocationPath, gopathRoot, includePrefix string) (string, error) {
 	var finalDestPath string
 	// handle internal dependency
 	// Consider the example below to understand the input and output paths:
@@ -587,15 +593,15 @@ func (br *gopathWrapper) copySrcHdrFiles(runner utils.Runner, libLocationPath, g
 		return "", fmt.Errorf("raw cc_library rule not found in monorepo: %s", libLocationPath)
 	}
 	// By default, the folder is read-only, relax it in order to rename it.
-	if _, _, err := utils.ExecCommand(runner, "chmod", "-R", "777", gopathRoot); err != nil {
+	if _, _, err := utils.ExecCommandContext(ctx, runner, "chmod", "-R", "777", gopathRoot); err != nil {
 		return "", fmt.Errorf("failed to make %q writable: %w", gopathRoot, err)
 	}
 
 	// Copy the raw cc_library rule to the lifted path location.
-	if _, _, err := utils.ExecCommand(runner, "mkdir", "-p", destPath); err != nil {
+	if _, _, err := utils.ExecCommandContext(ctx, runner, "mkdir", "-p", destPath); err != nil {
 		return "", fmt.Errorf("failed to create raw cc_library directory %q: %w", destPath, err)
 	}
-	if _, _, err := utils.ExecCommand(runner, "cp", "-r", libLocationPath, destPath); err != nil {
+	if _, _, err := utils.ExecCommandContext(ctx, runner, "cp", "-r", libLocationPath, destPath); err != nil {
 		return "", fmt.Errorf("failed to copy raw cc_library rule from %q to %q: %w", libLocationPath, destPath, err)
 	}
 	finalDestPath = filepath.Join(destPath, filepath.Base(libLocationPath))

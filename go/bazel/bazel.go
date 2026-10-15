@@ -1,6 +1,7 @@
 package bazel
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"io/fs"
@@ -62,10 +63,20 @@ type gopathWrapper struct {
 	Config        config.Config
 }
 
-// LiftGoPath takes the given target and runs bazel to lift the target, as well as its transitive
-// dependencies to form a GOPATH-like structure. The returned string is the path to the absolute
-// lifted directory that is readily available for running analysis and a set of C/C++ library dependencies of the target.
+// LiftGoPath keeps the uncanceled entrypoint required by the GoPathWrapper
+// interface. New callers should use LiftGoPathContext.
 func (br *gopathWrapper) LiftGoPath(runner utils.Runner, target string) (string, []string, error) {
+	return br.LiftGoPathContext(context.Background(), runner, target)
+}
+
+// LiftGoPathContext is the cancellation-aware variant of LiftGoPath: every
+// bazel/buildozer sub-command it spawns is bound to ctx, so a canceled run
+// (SIGINT/SIGTERM at the CLI, a canceled library context) kills the in-flight
+// `bazel build` instead of waiting it out. The BUILD.bazel write-back defer
+// still runs, and the partially-lifted directory is returned on cancellation
+// so the driver's GOPATH cleanup (which is registered regardless of lift
+// outcome) can remove it.
+func (br *gopathWrapper) LiftGoPathContext(ctx context.Context, runner utils.Runner, target string) (string, []string, error) {
 	// Check if bazel and buildozer are available.
 	if err := checkCommandAvailable(runner, br.BazelPath); err != nil {
 		return "", nil, err
@@ -106,14 +117,14 @@ func (br *gopathWrapper) LiftGoPath(runner utils.Runner, target string) (string,
 	// Regex to match def.bzl.*"go_path" the BUILD.bazel file.
 	if !goPathRegex.Match(data) {
 		// Ensure go_path is loaded
-		_, _, err = utils.ExecCommand(runner, br.BuildozerPath, "new_load @io_bazel_rules_go//go:def.bzl go_path", tgtWithPkg)
+		_, _, err = utils.ExecCommandContext(ctx, runner, br.BuildozerPath, "new_load @io_bazel_rules_go//go:def.bzl go_path", tgtWithPkg)
 		if err != nil {
 			return "", nil, err
 		}
 	}
 
 	// Add go_path rule
-	_, _, err = utils.ExecCommand(runner, br.BuildozerPath, fmt.Sprintf("new go_path %s-anal", targetName), tgtWithPkg)
+	_, _, err = utils.ExecCommandContext(ctx, runner, br.BuildozerPath, fmt.Sprintf("new go_path %s-anal", targetName), tgtWithPkg)
 	// If the rule already exists, ignore the error.
 	if err != nil && !strings.Contains(err.Error(), "already exists") {
 		return "", nil, err
@@ -126,34 +137,26 @@ func (br *gopathWrapper) LiftGoPath(runner utils.Runner, target string) (string,
 
 	gopathPkgAndPath := "//" + pkgPath + ":" + goPathTgtName
 	// Set testonly and include_data attributes
-	_, _, err = utils.ExecCommand(runner, br.BuildozerPath, "set testonly True", gopathPkgAndPath)
+	_, _, err = utils.ExecCommandContext(ctx, runner, br.BuildozerPath, "set testonly True", gopathPkgAndPath)
 	if err != nil && !(errors.As(err, &exitErr) && exitErr.ExitCode() == 3) {
 		return "", nil, err
 	}
-	_, _, err = utils.ExecCommand(runner, br.BuildozerPath, "set include_data False", gopathPkgAndPath)
+	_, _, err = utils.ExecCommandContext(ctx, runner, br.BuildozerPath, "set include_data False", gopathPkgAndPath)
 	if err != nil && !(errors.As(err, &exitErr) && exitErr.ExitCode() == 3) {
 		return "", nil, err
 	}
 
 	// Set deps attribute.
-	_, _, err = utils.ExecCommand(runner, br.BuildozerPath, fmt.Sprintf("add deps :%s", targetName), gopathPkgAndPath)
+	_, _, err = utils.ExecCommandContext(ctx, runner, br.BuildozerPath, fmt.Sprintf("add deps :%s", targetName), gopathPkgAndPath)
 	if err != nil && !(errors.As(err, &exitErr) && exitErr.ExitCode() == 3) {
 		return "", nil, err
 	}
 
-	// Run Bazel to build the target-anal.
-	stdout, stderr, err := utils.ExecCommand(runner, br.BazelPath, append(slices.Clone(_buildCmd), gopathPkgAndPath)...)
-	if err != nil {
-		return "", nil, err
-	}
-	buildLogPath := filepath.Join(br.OutputDir, fmt.Sprintf("%s_bazel_build.log", br.ServiceName))
-	br.Logger.Infow("Writing bazel build log", "path", buildLogPath)
-	if err := os.WriteFile(buildLogPath, []byte(fmt.Sprintf("STDOUT: %s\n\nSTDERR:%s", stdout, stderr)), 0666); err != nil {
-		return "", nil, fmt.Errorf("failed to write bazel build log to %q: %w", buildLogPath, err)
-	}
-
-	// Get the path to the root of the `bazel-bin` directory.
-	bazelBinPath, _, err := utils.ExecCommand(runner, br.BazelPath, "info", "bazel-bin")
+	// Get the path to the root of the `bazel-bin` directory up front, so a
+	// canceled/failed `bazel build` still knows the (partial) go_path tree's
+	// location for cleanup. This is the same `bazel info` the old code ran
+	// after the build -- merely reordered.
+	bazelBinPath, _, err := utils.ExecCommandContext(ctx, runner, br.BazelPath, "info", "bazel-bin")
 	if err != nil {
 		return "", nil, err
 	}
@@ -162,28 +165,50 @@ func (br *gopathWrapper) LiftGoPath(runner utils.Runner, target string) (string,
 	// Construct the GOPATH-root directory from target and bazel-bin path.
 	gopathRoot := filepath.Join(bazelBinPath, pkgPath, goPathTgtName)
 
-	err = br.processServerlessFix(runner, target, bazelBinPath, pkgPath, gopathRoot, gopathPkgAndPath)
+	// Run Bazel to build the target-anal.
+	stdout, stderr, err := utils.ExecCommandContext(ctx, runner, br.BazelPath, append(slices.Clone(_buildCmd), gopathPkgAndPath)...)
 	if err != nil {
+		// On cancellation the partial go_path tree may already exist; return
+		// its prospective path so the caller can schedule cleanup on it.
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return gopathRoot, nil, fmt.Errorf("lift GOPATH canceled: %w", ctxErr)
+		}
 		return "", nil, err
+	}
+	buildLogPath := filepath.Join(br.OutputDir, fmt.Sprintf("%s_bazel_build.log", br.ServiceName))
+	br.Logger.Infow("Writing bazel build log", "path", buildLogPath)
+	if err := os.WriteFile(buildLogPath, []byte(fmt.Sprintf("STDOUT: %s\n\nSTDERR:%s", stdout, stderr)), 0666); err != nil {
+		return gopathRoot, nil, fmt.Errorf("failed to write bazel build log to %q: %w", buildLogPath, err)
+	}
+
+	err = br.processServerlessFix(ctx, runner, target, bazelBinPath, pkgPath, gopathRoot, gopathPkgAndPath)
+	if err != nil {
+		return gopathRoot, nil, err
 	}
 
 	if err := br.patchIncorrectMoneyIntegrationGogoprotoDir(gopathRoot); err != nil {
-		return "", nil, fmt.Errorf("patch missing money integration test file: %w", err)
+		return gopathRoot, nil, fmt.Errorf("patch missing money integration test file: %w", err)
 	}
 
+	// The renamer is CPU-bound but bounded and its output tree is deleted by
+	// the driver on cancellation; check ctx before starting so a canceled run
+	// skips straight to cleanup rather than rewriting the tree first.
+	if err := ctx.Err(); err != nil {
+		return gopathRoot, nil, fmt.Errorf("lift GOPATH canceled: %w", err)
+	}
 	if err := br.renamer.Rename(gopathRoot, gopathRoot); err != nil {
-		return "", nil, err
+		return gopathRoot, nil, err
 	}
 
 	// Extract CGO flags, if any, by analyzing the C/C++ dependencies ("cdeps") of the target.
-	cdeps, err := br.processCGo(runner, target, gopathRoot)
+	cdeps, err := br.processCGo(ctx, runner, target, gopathRoot)
 	if err != nil {
-		return "", nil, err
+		return gopathRoot, cdeps, err
 	}
 
 	// Fix import comment of the package.
-	if err := br.fixImportComment(runner, gopathRoot); err != nil {
-		return "", nil, err
+	if err := br.fixImportComment(ctx, runner, gopathRoot); err != nil {
+		return gopathRoot, nil, err
 	}
 
 	return gopathRoot, cdeps, nil

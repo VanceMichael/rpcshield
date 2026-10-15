@@ -21,6 +21,7 @@ go_test(
     name = "go_default_test",
     size = "large",
     srcs = [
+        "atomic_write_test.go",
         "csv_test.go",
         "html_test.go",
     ],

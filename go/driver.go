@@ -231,6 +231,33 @@ const (
 	Error Status = "error"
 )
 
+// ErrCanceled is the recognizable cancellation error returned by Driver.Run
+// (and the stages it drives) when the run is aborted by a canceled context --
+// SIGINT/SIGTERM at the CLI or a caller-canceled context. It wraps the
+// underlying context error (context.Canceled / context.DeadlineExceeded), so
+// callers can identify cancellation either via errors.Is(err, ErrCanceled) or
+// errors.Is(err, context.Canceled), and distinguish it from the ordinary
+// analysis/load diagnostics that keep being returned for every other failure.
+var ErrCanceled = errors.New("rpcshield: analysis canceled")
+
+// canceledErr wraps ErrCanceled together with the underlying context error.
+// Returns nil when ctx is not done.
+func canceledErr(ctx context.Context) error {
+	if ctx == nil {
+		return nil
+	}
+	if err := ctx.Err(); err != nil {
+		return fmt.Errorf("%w: %w", ErrCanceled, err)
+	}
+	return nil
+}
+
+// isContextError reports whether err is a context cancellation/timeout error
+// (as opposed to an analyzer/load diagnostic).
+func isContextError(err error) bool {
+	return errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded)
+}
+
 // Result contains the result of the rpcshield run.
 type Result struct {
 	// Status indicates the overall status of the rpcshield run.
@@ -304,9 +331,19 @@ var _missingSVG string
 // Run is the entrypoint of the driver. It never panics (if it does, it will be caught and returned
 // as an error).
 func (d *Driver) Run(ctx context.Context, serviceName string) (result Result, err error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	defer func() {
 		if r := recover(); r != nil {
 			err = errors.Join(err, fmt.Errorf("panic: %v, stacktrace:\n%v", r, string(debug.Stack())))
+		}
+		// If a stage silently returned nil on a canceled context, surface the
+		// recognizable cancellation error instead of treating it as success.
+		if err == nil {
+			if cErr := canceledErr(ctx); cErr != nil {
+				err = cErr
+			}
 		}
 		// Overwrite the result status if there was an error.
 		if err != nil {
@@ -316,13 +353,33 @@ func (d *Driver) Run(ctx context.Context, serviceName string) (result Result, er
 			// the in-memory copy after the file has already been written.
 			result.ErrorMsg = err.Error()
 		}
-		// Write result to the output directory for debugging purposes.
-		f, fOpenError := os.Create(filepath.Join(d.opts.OutputDir, fmt.Sprintf("%s_result.json", serviceName)))
-		if fOpenError != nil {
-			err = errors.Join(err, fmt.Errorf("create result file: %w", fOpenError))
+		// A canceled run must NOT overwrite a previous run's complete
+		// result.json with partial content: a prefix of a multi-target
+		// analysis is not a trusted artifact. Skip persistence entirely.
+		if errors.Is(err, ErrCanceled) {
+			d.Logger.Warnw("Skipping result.json write: run was canceled", "service", serviceName)
+			return
 		}
-		err = errors.Join(err, json.NewEncoder(f).Encode(result))
-		err = errors.Join(err, f.Close())
+		// Write result to the output directory for debugging purposes.
+		// Encode to a temp file in the same directory and atomically rename
+		// it into place, so an interrupted/failed encode cannot truncate an
+		// already-present complete result.json.
+		resultPath := filepath.Join(d.opts.OutputDir, fmt.Sprintf("%s_result.json", serviceName))
+		f, fOpenError := os.CreateTemp(d.opts.OutputDir, fmt.Sprintf(".%s_result.json.tmp-*", serviceName))
+		if fOpenError != nil {
+			err = errors.Join(err, fmt.Errorf("create result temp file: %w", fOpenError))
+		} else {
+			tmpPath := f.Name()
+			encErr := json.NewEncoder(f).Encode(result)
+			closeErr := f.Close()
+			if encErr != nil || closeErr != nil {
+				os.Remove(tmpPath)
+				err = errors.Join(err, fmt.Errorf("encode result: %w", encErr), fmt.Errorf("close result temp file: %w", closeErr))
+			} else if renameErr := os.Rename(tmpPath, resultPath); renameErr != nil {
+				os.Remove(tmpPath)
+				err = errors.Join(err, fmt.Errorf("finalize result file: %w", renameErr))
+			}
+		}
 		if err != nil {
 			result.ErrorMsg = err.Error()
 		}
@@ -355,9 +412,15 @@ func (d *Driver) Run(ctx context.Context, serviceName string) (result Result, er
 	}
 
 	start := time.Now()
+	if err := canceledErr(ctx); err != nil {
+		return result, err
+	}
 	targets, err := d.findTargets(serviceName)
 	if err != nil {
 		return result, fmt.Errorf("find targets: %w", err)
+	}
+	if err := canceledErr(ctx); err != nil {
+		return result, err
 	}
 	result.RunMetrics[_targetCount] = float64(len(targets))
 	result.RunMetrics[_findTargetDurationSecs] = time.Now().Sub(start).Seconds()
@@ -431,6 +494,12 @@ func (d *Driver) Run(ctx context.Context, serviceName string) (result Result, er
 	start = time.Now()
 	pathCache := make(map[string]bool)
 	for tidx, target := range targets {
+		// Stop accepting new targets after cancellation. Targets already in
+		// flight are handled by the per-stage checks below; a prefix of a
+		// multi-target analysis must never be reported as a success.
+		if err := canceledErr(ctx); err != nil {
+			return result, err
+		}
 		// Service configs occasionally list bare-workspace target labels (pkg/path:name)
 		// without the //-prefix. Bazel interprets bare labels relative to the process cwd,
 		// which for rpcshield is generally not the workspace root -- so any downstream
@@ -449,7 +518,13 @@ func (d *Driver) Run(ctx context.Context, serviceName string) (result Result, er
 			var err error
 			pkgs, ssaPkgs, ssaProg, err = d.opts.PackageSource(target)
 			if err != nil {
+				if isContextError(err) {
+					return result, canceledErr(ctx)
+				}
 				return result, fmt.Errorf("load packages from PackageSource: %w", err)
+			}
+			if err := canceledErr(ctx); err != nil {
+				return result, err
 			}
 			d.Logger.Infow("Loaded packages via PackageSource", "num_packages", len(pkgs))
 			result.RunMetrics[_pkgCount] += float64(len(pkgs))
@@ -464,7 +539,13 @@ func (d *Driver) Run(ctx context.Context, serviceName string) (result Result, er
 				pkgs = append(pkgs, pkg)
 			})
 			if err != nil {
+				if isContextError(err) {
+					return result, canceledErr(ctx)
+				}
 				return result, fmt.Errorf("load all packages under %q: %w", targetPkgPath, err)
+			}
+			if err := canceledErr(ctx); err != nil {
+				return result, err
 			}
 			d.Logger.Infow("Loaded packages", "num_packages", len(pkgs))
 			d.Logger.Debugw("Packages", "packages", pkgs)
@@ -475,34 +556,29 @@ func (d *Driver) Run(ctx context.Context, serviceName string) (result Result, er
 			ssaPkgs = ssaProg.AllPackages()
 			ssaProg.Build()
 		} else {
-			goPath, cdeps, err := d.GoPathWrapper.LiftGoPath(d.Runner, target)
-			if err != nil {
-				return result, fmt.Errorf("lift GOPATH: %w", err)
+			goPath, cdeps, liftErr := d.liftGoPath(ctx, target)
+			// Schedule GOPATH cleanup whether lifting succeeded, failed, or
+			// was canceled: a canceled `bazel build` can leave a partial tree
+			// on disk that must still be reclaimed when the run exits.
+			if goPath != "" {
+				defer d.scheduleGoPathCleanup(goPath)
+			}
+			if liftErr != nil {
+				if isContextError(liftErr) {
+					return result, canceledErr(ctx)
+				}
+				return result, fmt.Errorf("lift GOPATH: %w", liftErr)
 			}
 			d.Logger.Infow("Lifted GOPATH", "path", goPath, "cdeps", cdeps)
 			result.RunMetrics[_liftGoPathDurationSecs] += time.Now().Sub(start).Seconds()
-			defer func() {
-				if testing.Testing() {
-					d.Logger.Infow("Testing mode, not cleaning up GOPATH", "path", goPath)
-					return
-				}
-				if d.opts.KeepGoPathAfterRun {
-					d.Logger.Infow("KeepGoPathAfterRun set, not cleaning up GOPATH", "path", goPath)
-					return
-				}
-				d.Logger.Infow("Starting a detached process to remove GOPATH to save space", "path", goPath)
-				cmd := exec.Command("rm", "-rf", goPath)
-				cmd.SysProcAttr = &syscall.SysProcAttr{Setsid: true} // Start a new session to detach the process.
-				if err := cmd.Start(); err != nil {
-					d.Logger.Errorw("Failed to start the process", "error", err)
-				}
-				d.Logger.Infow("Started detached process", "pid", cmd.Process.Pid)
-			}()
 
 			// Load everything under the GOPATH.
 			pkgs, err = loader.LoadAll(goPath, cdeps)
 			if err != nil {
 				return result, fmt.Errorf("load all packages under %q: %w", goPath, err)
+			}
+			if err := canceledErr(ctx); err != nil {
+				return result, err
 			}
 			d.Logger.Infow("Loaded packages", "num_packages", len(pkgs))
 			d.Logger.Debugw("Packages", "packages", pkgs)
@@ -516,6 +592,9 @@ func (d *Driver) Run(ctx context.Context, serviceName string) (result Result, er
 			// Build the SSA program; needed for getting generics instantiated and funclits resolved.
 			// Also needed for call graph construction.
 			ssaProg.Build()
+		}
+		if err := canceledErr(ctx); err != nil {
+			return result, err
 		}
 		result.RunMetrics[_pkgLoadingDurationSecs] += time.Now().Sub(start).Seconds()
 
@@ -574,7 +653,10 @@ func (d *Driver) Run(ctx context.Context, serviceName string) (result Result, er
 
 		// Early exit for CG construction-only eval bench
 		if d.opts.CGConstructionOnly {
-			if err := d.runCGConstructionOnly(pkgs, ssaProg, ssaPkgs, isGlue, entryPkg, inbounds, serviceName, &result); err != nil {
+			if err := d.runCGConstructionOnly(ctx, pkgs, ssaProg, ssaPkgs, isGlue, entryPkg, inbounds, serviceName, &result); err != nil {
+				if isContextError(err) {
+					return result, canceledErr(ctx)
+				}
 				return result, err
 			}
 
@@ -588,6 +670,9 @@ func (d *Driver) Run(ctx context.Context, serviceName string) (result Result, er
 		outbounds, outboundMissingServiceCount, err := f.Outbound(entryPkg, pkgs)
 		if err != nil {
 			return result, fmt.Errorf("find outbound: %w", err)
+		}
+		if err := canceledErr(ctx); err != nil {
+			return result, err
 		}
 
 		for k, v := range outboundMissingServiceCount {
@@ -669,6 +754,7 @@ func (d *Driver) Run(ctx context.Context, serviceName string) (result Result, er
 			PermutationThreshold:    d.opts.PermutationThreshold,
 			CodebasePkgPrefix:       d.opts.Config.CodebasePkgPrefix,
 			SafeGoPkgPath:           d.opts.Config.SafeGoPkgPath,
+			Context:                 ctx,
 		}
 		if d.opts.Config.ExcludePackagePatterns != nil || len(d.opts.Config.ExtraExcludePackagePatterns) > 0 {
 			base := graph.DefaultExcludePackagePatterns
@@ -696,6 +782,9 @@ func (d *Driver) Run(ctx context.Context, serviceName string) (result Result, er
 		}
 		if err != nil {
 			d.Logger.Errorf("Error in builder: %v", err)
+			if isContextError(err) {
+				return result, canceledErr(ctx)
+			}
 			return result, err
 		}
 
@@ -755,7 +844,14 @@ func (d *Driver) Run(ctx context.Context, serviceName string) (result Result, er
 		// Traverse over each call path and run static and LLM analyzers to determine fail-ness status of the path.
 		start = time.Now()
 		d.Logger.Infow("Analyzing call paths", "analyzers", d.opts.Analyzers, "num_paths", len(paths))
-		reports = append(reports, d.analyzeCallPaths(pkgs, paths)...)
+		pathReports, analyzeErr := d.analyzeCallPaths(ctx, pkgs, paths)
+		reports = append(reports, pathReports...)
+		if analyzeErr != nil {
+			if isContextError(analyzeErr) {
+				return result, canceledErr(ctx)
+			}
+			return result, analyzeErr
+		}
 		// Collect the total counts of each analyzer kind for observability purposes.
 		kindStats := make(map[constant.AnalyzerKind]int)
 		// Collect the total counts of each fail-ness status across call paths for observability purposes.
@@ -1113,7 +1209,12 @@ func (d *Driver) enrichReportMetrics(reports []output.Report, explorationPerSour
 // analyzeCallPaths analyzes the call paths and returns the results of the analysis wrapped in output.Report.
 // Note that we output reports for each path in the callPaths, aggregating the results by inbound-outbound quadruple
 // happens in another function.
-func (d *Driver) analyzeCallPaths(pkgs []*packages.Package, callPaths []*graph.CallPath) []output.Report {
+//
+// Cancellation is checked between paths and between hops. A canceled in-flight
+// LLM request aborts itself through the HTTP client's context. On cancellation
+// the function returns the reports completed so far plus the context error;
+// the driver discards the prefix -- it is never written to any artifact.
+func (d *Driver) analyzeCallPaths(ctx context.Context, pkgs []*packages.Package, callPaths []*graph.CallPath) ([]output.Report, error) {
 	allPkgsMap := make(map[string]*packages.Package, len(pkgs))
 	for _, p := range pkgs {
 		allPkgsMap[p.PkgPath] = p
@@ -1137,14 +1238,27 @@ func (d *Driver) analyzeCallPaths(pkgs []*packages.Package, callPaths []*graph.C
 	// Analyze each path in `callPaths`.
 	allResults := make([]output.Report, 0, len(callPaths))
 	for _, path := range callPaths {
+		// Check cancellation before starting each new path.
+		if err := ctx.Err(); err != nil {
+			return allResults, err
+		}
 		edgeResults := make([]*output.EdgeWrapper, 0, len(path.Edges))
 		// Analyze each edge (caller-callee pair) in call path in reverse order, i.e., from outbound to inbound.
 		for j := len(path.Edges) - 1; j >= 0; j-- {
+			// Check cancellation before each hop so an in-flight LLM request
+			// is the only work that has to finish (it aborts on ctx itself).
+			if err := ctx.Err(); err != nil {
+				return allResults, err
+			}
 			var prevEdgeResult *output.EdgeWrapper
 			if len(edgeResults) > 0 {
 				prevEdgeResult = edgeResults[len(edgeResults)-1]
 			}
-			edgeResults = append(edgeResults, d.analyzeEdge(path.Edges[j], allPkgsMap, prevEdgeResult))
+			edgeResult, err := d.analyzeEdge(ctx, path.Edges[j], allPkgsMap, prevEdgeResult)
+			if err != nil {
+				return allResults, err
+			}
+			edgeResults = append(edgeResults, edgeResult)
 		}
 
 		status := output.AggregatedStatus(edgeResults)
@@ -1184,10 +1298,17 @@ func (d *Driver) analyzeCallPaths(pkgs []*packages.Package, callPaths []*graph.C
 		d.simplifiedToDetailedInbound[report.Inbound] = path.Inbound
 		d.simplifiedToDetailedOutbound[report.Outbound] = path.Outbound
 	}
-	return allResults
+	return allResults, nil
 }
 
-func (d *Driver) analyzeEdge(edge *edgeinfo.EdgeInfo, allPkgsMap map[string]*packages.Package, prevEdgeResult *output.EdgeWrapper) (edgeResult *output.EdgeWrapper) {
+// analyzeEdge analyzes a single edge (hop) of a call path. Ordinary analyzer
+// failures are attached to edgeResult.Errors as before (non-cancel errors keep
+// their diagnostics), while context cancellation is returned as the error so
+// the whole analysis converges and reports ErrCanceled.
+func (d *Driver) analyzeEdge(ctx context.Context, edge *edgeinfo.EdgeInfo, allPkgsMap map[string]*packages.Package, prevEdgeResult *output.EdgeWrapper) (edgeResult *output.EdgeWrapper, err error) {
+	if ctxErr := ctx.Err(); ctxErr != nil {
+		return nil, ctxErr
+	}
 	cgEdge := edge.Edge
 	caller := cgEdge.Caller.Func
 
@@ -1297,14 +1418,17 @@ func (d *Driver) analyzeEdge(edge *edgeinfo.EdgeInfo, allPkgsMap map[string]*pac
 	//  the fail-ness status of the edges.
 
 	// Run the Cached analyzer, static analyzers (Predefined, SSA, and AST), and LLM analyzer.
-	analyzerOutput, err := d.runAnalyzers(caller, callee, calleeObj, cgEdge.Site, astContext, edgeResult.SourceGraphLink)
-	if err != nil {
-		edgeResult.Errors = append(edgeResult.Errors, fmt.Sprintf("run analyzers: %s", err))
+	analyzerOutput, runErr := d.runAnalyzers(ctx, caller, callee, calleeObj, cgEdge.Site, astContext, edgeResult.SourceGraphLink)
+	if runErr != nil {
+		if isContextError(runErr) {
+			return nil, runErr
+		}
+		edgeResult.Errors = append(edgeResult.Errors, fmt.Sprintf("run analyzers: %s", runErr))
 	}
 	if analyzerOutput != nil {
 		edgeResult.AnalyzerOutput = *analyzerOutput
 	}
-	return
+	return edgeResult, nil
 }
 
 func (d *Driver) getLastModifiedTimestamp(runner utils.Runner, caller string, filePath string, repoPath string) (string, error) {
@@ -1410,7 +1534,13 @@ func (d *Driver) queryTimestamp(runner utils.Runner, caller string, fullyCallerF
 // 2. Run the Predefined analyzer. If it returns a non-unknown status, return it.
 // 3. Run the SCCP analyzer. If it returns a non-unknown status, return it.
 // 4. Fall back to SSA, then AST, then LLM analyzers if SCCP fails or returns unknown.
-func (d *Driver) runAnalyzers(caller *ssa.Function, callee *ast.CallExpr, calleeObj types.Object, calleeSite ssa.CallInstruction, astContext *asthelper.ASTContext, sgLink string) (analyzerOutput *output.AnalyzerOutput, err error) {
+func (d *Driver) runAnalyzers(ctx context.Context, caller *ssa.Function, callee *ast.CallExpr, calleeObj types.Object, calleeSite ssa.CallInstruction, astContext *asthelper.ASTContext, sgLink string) (analyzerOutput *output.AnalyzerOutput, err error) {
+	// The context reaches the LLM HTTP request -- the only I/O-blocking
+	// analyzer. A canceled in-flight request propagates the context error
+	// instead of becoming a FailUnknownWithError edge diagnostic.
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	source := constant.Unknown
 
 	// As a last resort, we recover from a panic when running the analyzer, convert the panic to
@@ -1543,8 +1673,14 @@ func (d *Driver) runAnalyzers(caller *ssa.Function, callee *ast.CallExpr, callee
 		if prepErr != nil {
 			return nil, fmt.Errorf("prepare AST context for LLM analyzer: %w", prepErr)
 		}
-		analyzerOutput, err = d.runLLMAnalyzer(callerFuncDecl, callee, calleeObj, astContext)
+		analyzerOutput, err = d.runLLMAnalyzer(ctx, callerFuncDecl, callee, calleeObj, astContext)
 		if err != nil {
+			// Cancellation (incl. an aborted in-flight LLM HTTP request) is
+			// propagated as-is, not downgraded to a FailUnknownWithError
+			// diagnostic: the whole run is unwinding with ErrCanceled.
+			if isContextError(err) {
+				return nil, err
+			}
 			err = errors.Join(err, fmt.Errorf("run LLM analyzer: %w", err))
 			if analyzerOutput == nil {
 				analyzerOutput = &output.AnalyzerOutput{}
@@ -1558,7 +1694,10 @@ func (d *Driver) runAnalyzers(caller *ssa.Function, callee *ast.CallExpr, callee
 	return
 }
 
-func (d *Driver) runLLMAnalyzer(caller *ast.FuncDecl, callee *ast.CallExpr, calleeObj types.Object, astContext *asthelper.ASTContext) (*output.AnalyzerOutput, error) {
+func (d *Driver) runLLMAnalyzer(ctx context.Context, caller *ast.FuncDecl, callee *ast.CallExpr, calleeObj types.Object, astContext *asthelper.ASTContext) (*output.AnalyzerOutput, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	if calleeObj == nil {
 		return nil, fmt.Errorf("callee is nil")
 	}
@@ -1568,7 +1707,9 @@ func (d *Driver) runLLMAnalyzer(caller *ast.FuncDecl, callee *ast.CallExpr, call
 	filePath := startPos.Filename
 	llmCallerFuncInput := input.NewLLMFuncInput(caller.Name.Name, filePath, startPos.Line, endPos.Line)
 	llmAnalyzerInput := input.NewLLMAnalyzerInput(llmCallerFuncInput, calleeObj.Name(), calleeSitePosition.Line)
-	analyzerOutput, err := genai.LLMAnalyzer(context.Background(), d.AIClient, "", llmAnalyzerInput, d.Logger)
+	// The HTTP client honors ctx: SIGINT/SIGTERM or caller cancellation abort
+	// a request already in flight instead of waiting for the model to answer.
+	analyzerOutput, err := genai.LLMAnalyzer(ctx, d.AIClient, "", llmAnalyzerInput, d.Logger)
 	if err != nil {
 		return nil, fmt.Errorf("run LLM analyzer: %w", err)
 	}
@@ -1646,6 +1787,53 @@ func (d *Driver) findTargets(serviceName string) ([]string, error) {
 		resolver = NewPinocchioTargetResolver(d.WorkspaceRoot, d.Logger)
 	}
 	return resolver.FindTargets(serviceName)
+}
+
+// liftGoPath lifts the GOPATH for the given target. When the configured
+// GoPathWrapper supports cancellation (bazel.ContextGoPathWrapper -- the real
+// *bazel.gopathWrapper does), an in-flight bazel/buildozer sub-command is
+// killed as soon as ctx is canceled. Wrappers that only satisfy the basic
+// interface keep working; cancellation is observed around their call instead.
+func (d *Driver) liftGoPath(ctx context.Context, target string) (string, []string, error) {
+	if cgp, ok := d.GoPathWrapper.(bazel.ContextGoPathWrapper); ok {
+		return cgp.LiftGoPathContext(ctx, d.Runner, target)
+	}
+	goPath, cdeps, err := d.GoPathWrapper.LiftGoPath(d.Runner, target)
+	if err != nil {
+		return goPath, cdeps, err
+	}
+	return goPath, cdeps, canceledErr(ctx)
+}
+
+// scheduleGoPathCleanup reclaims the disk of a lifted GOPATH tree once the run
+// exits. Cleanup is intentionally detached (`setsid` + `rm -rf`) so the
+// potentially large tree is removed without blocking the process. Existing
+// policy is preserved:
+//   - under `go test` the tree is kept (fixtures reuse it);
+//   - KeepGoPathAfterRun keeps the tree (devpod cache warm/reuse);
+//   - every other run -- including runs aborted by cancellation -- cleans up.
+func (d *Driver) scheduleGoPathCleanup(goPath string) {
+	if testing.Testing() {
+		d.Logger.Infow("Testing mode, not cleaning up GOPATH", "path", goPath)
+		return
+	}
+	if d.opts.KeepGoPathAfterRun {
+		d.Logger.Infow("KeepGoPathAfterRun set, not cleaning up GOPATH", "path", goPath)
+		return
+	}
+	if err := removeGoPathDetached(goPath); err != nil {
+		d.Logger.Errorw("Failed to start the GOPATH removal process", "error", err)
+	}
+}
+
+// removeGoPathDetached starts a detached (`setsid`) `rm -rf` process for the
+// given path and returns immediately once it has started. The detached
+// process outlives the analysis so the potentially huge tree is reclaimed
+// after the run exits without blocking it.
+func removeGoPathDetached(goPath string) error {
+	cmd := exec.Command("rm", "-rf", goPath)
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setsid: true} // Start a new session to detach the process.
+	return cmd.Start()
 }
 
 // findPackageFromTarget finds the package (hinted by the binary bazel target) as the entry point.

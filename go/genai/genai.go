@@ -167,6 +167,11 @@ func AnalyzeEdge(ctx context.Context, aiClient Client, req *AnalyzeEdgeRequest, 
 	if err != nil {
 		return nil, fmt.Errorf("dump function source: %w", err)
 	}
+	// Between edges, bail out promptly on cancellation instead of issuing
+	// more chat completions.
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	longQuestion := promptMessage + question + detailer + funcSource + "\n"
 	responseString, err := AskGenAI(ctx, aiClient, longQuestion)
 	if err != nil {

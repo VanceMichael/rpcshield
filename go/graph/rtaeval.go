@@ -1,6 +1,7 @@
 package graph
 
 import (
+	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"errors"
@@ -265,8 +266,13 @@ func (b *builderImpl) getRTAEntryFunctions() ([]*ssa.Function, error) {
 }
 
 // runSingleFlavor runs a single RTA flavor with a given worker count and collects all metrics.
-// It returns the resulting callgraph.
-func (b *builderImpl) runSingleFlavor(entry []*ssa.Function, flavor RTAFlavor, numWorkers int) (*callgraph.Graph, error) {
+// It returns the resulting callgraph. When ctx is canceled during analysis,
+// the RTA implementation returns a nil result and this returns the
+// cancellation error once its workers have converged.
+func (b *builderImpl) runSingleFlavor(ctx context.Context, entry []*ssa.Function, flavor RTAFlavor, numWorkers int) (*callgraph.Graph, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, fmt.Errorf("graph build canceled: %w", err)
+	}
 	// Get baseline memory before this run
 	runtime.GC()
 	var memStatsBefore runtime.MemStats
@@ -332,8 +338,11 @@ func (b *builderImpl) runSingleFlavor(entry []*ssa.Function, flavor RTAFlavor, n
 			<-memTrackerDone
 			return nil, fmt.Errorf("unknown RTA flavor: %s", flavorStr)
 		}
-		opts := append([]rta.AnalyzeOption{rta.WithNumWorkers(numWorkers)}, rtaOpts...)
+		opts := append([]rta.AnalyzeOption{rta.WithNumWorkers(numWorkers), rta.WithContext(ctx)}, rtaOpts...)
 		res := rtaImpl.Analyze(entry, true, opts...)
+		// Cancellation: implementations return nil once workers converge.
+		// Fall through to the common measurement cleanup below; the nil
+		// cgResult + ctx check at the end of the function surfaces the error.
 		if res != nil {
 			cgResult = res.GetCallGraph()
 			b.collectRTAMetrics(res, flavorStr, numWorkers)
@@ -401,6 +410,10 @@ func (b *builderImpl) runSingleFlavor(entry []*ssa.Function, flavor RTAFlavor, n
 			edgeCount += len(node.Out)
 		}
 		b.metrics[fmt.Sprintf("rta_callgraph_edges_%s_%d_workers", flavorStr, numWorkers)] = float64(edgeCount)
+	}
+
+	if cgResult == nil && ctx.Err() != nil {
+		return nil, fmt.Errorf("graph build canceled: %w", ctx.Err())
 	}
 
 	return cgResult, nil
@@ -545,6 +558,10 @@ func ensureStdlibFirst(flavors []RTAFlavor) []RTAFlavor {
 // buildCGOnlySweep implements the BuildCGOnly logic: sweeps across all configured
 // flavors and worker counts, collecting metrics. This is only used for benchmarking.
 func (b *builderImpl) buildCGOnlySweep() (map[string]float64, error) {
+	ctx := b.context()
+	if err := b.checkCancel(); err != nil {
+		return nil, err
+	}
 	runtime.GC()
 	defer runtime.GC()
 
@@ -589,10 +606,14 @@ func (b *builderImpl) buildCGOnlySweep() (map[string]float64, error) {
 		}
 
 		for workerIdx, numWorkers := range workersToRun {
+			// Do not start another flavor/worker combination after cancellation.
+			if err := ctx.Err(); err != nil {
+				return nil, fmt.Errorf("graph build canceled: %w", err)
+			}
 			b.logger.Infof("Running RTA flavor %d/%d, worker config %d/%d: %s with %d workers",
 				flavorIdx+1, len(flavors), workerIdx+1, len(workersToRun), flavor, numWorkers)
 
-			cg, err := b.runSingleFlavor(entry, flavor, numWorkers)
+			cg, err := b.runSingleFlavor(ctx, entry, flavor, numWorkers)
 			if err != nil {
 				b.logger.Errorf("Error running RTA flavor %s: %v", flavor, err)
 				return nil, err

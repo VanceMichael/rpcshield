@@ -46,10 +46,30 @@ func WriteReportsToHTML(outputDir string, service string, reports []output.Repor
 		return "", fmt.Errorf("failed to execute HTML template: %v", err)
 	}
 
-	// Create an HTML file in the output directory with the name `<service>.html`
+	// Create an HTML file in the output directory with the name `<service>.html`.
 	htmlFilePath := filepath.Join(outputDir, getHTMLFileName(service))
-	if err = os.WriteFile(htmlFilePath, buf.Bytes(), 0644); err != nil {
-		return "", fmt.Errorf("failed to write HTML content to file: %v", err)
+	// Write to a temp file in the same directory and atomically rename into
+	// place: a failed/canceled write cannot truncate an existing complete HTML
+	// report.
+	tmpFile, err := os.CreateTemp(outputDir, fmt.Sprintf(".%s.html.tmp-*", service))
+	if err != nil {
+		return "", fmt.Errorf("failed to create temp HTML file: %v", err)
+	}
+	tmpPath := tmpFile.Name()
+	defer os.Remove(tmpPath)
+	if _, err := tmpFile.Write(buf.Bytes()); err != nil {
+		tmpFile.Close()
+		return "", fmt.Errorf("failed to write HTML content to temp file: %v", err)
+	}
+	if err := tmpFile.Close(); err != nil {
+		return "", fmt.Errorf("failed to close temp HTML file: %v", err)
+	}
+	// Match os.WriteFile's default permissions (CreateTemp creates 0600).
+	if err := os.Chmod(tmpPath, 0644); err != nil {
+		return "", fmt.Errorf("failed to chmod temp HTML file: %v", err)
+	}
+	if err := os.Rename(tmpPath, htmlFilePath); err != nil {
+		return "", fmt.Errorf("failed to finalize HTML file: %v", err)
 	}
 	return htmlFilePath, nil
 }

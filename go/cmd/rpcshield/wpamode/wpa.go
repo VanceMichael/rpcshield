@@ -177,7 +177,16 @@ type Options struct {
 const _numRenameWorkers = 16
 
 // Run is the entrypoint for running whole program analysis mode of rpcshield.
-func Run(options Options) (rpcshield.Result, error) {
+// The supplied ctx carries SIGINT/SIGTERM cancellation (from the CLI) or a
+// caller cancellation (from library integrations) into the driver: a
+// canceled run stops accepting new targets and work units, waits for workers
+// already started to converge, preserves prior complete artifacts, cleans up
+// lifted GOPATH trees, and returns an error wrapping context.Canceled (also
+// discoverable via rpcshield.ErrCanceled).
+func Run(ctx context.Context, options Options) (rpcshield.Result, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	if options.CPUProfile != "" {
 		f, err := os.Create(options.CPUProfile)
 		if err != nil {
@@ -243,9 +252,6 @@ func Run(options Options) (rpcshield.Result, error) {
 	redacted.GrailUSSOToken = "<REDACTED>"
 	redacted.GenAIAPIUSSOToken = "<REDACTED>"
 	logger.Infow("Running WPA", "options", redacted)
-
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
 
 	runner := utils.OSRunner{}
 	renamer := bazel.NewFSRenamer(utils.OSFileSystem{}, _numRenameWorkers, logger)
@@ -405,7 +411,13 @@ func Run(options Options) (rpcshield.Result, error) {
 	if options.ReportMetrics && options.ReportResult == nil {
 		logger.Warnw("ReportMetrics is set but no ReportResult configured, skipping reporting")
 	}
-	if options.ReportMetrics && options.ReportResult != nil {
+	if options.ReportMetrics && errors.Is(err, rpcshield.ErrCanceled) {
+		// A canceled run is an aborted partial computation: skip external
+		// LDA reporting side effects so no metrics are emitted for a prefix
+		// of the analysis.
+		logger.Warnw("Skipping LDA metrics reporting: run was canceled", "service", options.Service)
+	}
+	if options.ReportMetrics && options.ReportResult != nil && !errors.Is(err, rpcshield.ErrCanceled) {
 		logger.Infow("reporting result via LDA", "service", options.Service)
 		// Add additional meta metrics of the run to the result metrics.
 		values := map[string]string{

@@ -1,8 +1,8 @@
-load("@io_bazel_rules_go//go:def.bzl", "go_binary", "go_library")
+load("@io_bazel_rules_go//go:def.bzl", "go_binary", "go_library", "go_test")
 
 go_library(
     name = "rpcshield_lib",
-    srcs = ["main.go"],
+    srcs = ["main.go", "signals.go"],
     importpath = "github.com/uber-research/rpcshield/go/cmd/rpcshield",
     visibility = ["//visibility:private"],
     deps = [
@@ -19,4 +19,13 @@ go_binary(
     name = "rpcshield",
     embed = [":rpcshield_lib"],
     visibility = ["//visibility:public"],
+)
+
+go_test(
+    name = "rpcshield_test",
+    srcs = ["signals_test.go"],
+    embed = [":rpcshield_lib"],
+    deps = [
+        "@com_github_stretchr_testify//require:go_default_library",
+    ],
 )

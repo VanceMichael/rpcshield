@@ -18,11 +18,16 @@ go_library(
 
 go_test(
     name = "go_default_test",
-    srcs = ["impl_test.go"],
+    srcs = ["impl_cancel_test.go", "impl_test.go"],
     data = [
         "//exampleapps/rpcshielddemo:rpcshielddemo-anal",
         "@go_sdk//:files",
     ],
     embed = [":go_default_library"],
-    deps = ["//rta/rtatest:go_default_library"],
+    deps = [
+        "//rta:go_default_library",
+        "//rta/rtatest:go_default_library",
+        "@com_github_stretchr_testify//require:go_default_library",
+        "@org_golang_x_tools//go/ssa:go_default_library",
+    ],
 )

@@ -784,8 +784,27 @@ func (a *RTA) Analyze(roots []*ssa.Function, buildCallGraph bool, opts ...rtalib
 	r.interfaceTypes.SetHasher(hasher)
 
 	r.pool.Start(func(item workItem, workerID int) {
+		// Dropped cheaply after cancellation: the item is already balanced
+		// by Push/WaitGroup accounting; skipping doWork keeps convergence
+		// prompt regardless of how expensive the item would have been.
+		if r.pool.IsCancelled() {
+			return
+		}
 		item.doWork(r, workerID)
 	})
+
+	// Bridge context cancellation to the worker pool: on ctx cancel, stop
+	// accepting work and wake blocked workers. The watcher exits when
+	// analysis finishes (stopWatcher closed), so it never outlives Analyze.
+	ctx := cfg.ContextOrBackground()
+	stopWatcher := make(chan struct{})
+	go func() {
+		select {
+		case <-ctx.Done():
+			r.pool.Cancel()
+		case <-stopWatcher:
+		}
+	}()
 
 	// Add the initial work via the pool's mainbox; workers steal from it.
 	for _, root := range roots {
@@ -801,6 +820,17 @@ func (a *RTA) Analyze(roots []*ssa.Function, buildCallGraph bool, opts ...rtalib
 
 	// Wait for RTA-related work to complete
 	r.pool.Wait()
+
+	// Analysis is over (either converged or canceled): release the context
+	// watcher and shut the pool down.
+	close(stopWatcher)
+	r.pool.Stop()
+
+	// A canceled analysis yields no usable result; callers distinguish
+	// cancellation from "no roots" via ctx.Err().
+	if ctx.Err() != nil {
+		return nil
+	}
 
 	// Edges are attached directly to node.In / node.Out via per-node mutex
 	// inside g.AddCallGraphEdge during the parallel phase; no merge needed.
@@ -821,9 +851,6 @@ func (a *RTA) Analyze(roots []*ssa.Function, buildCallGraph bool, opts ...rtalib
 
 	postDedupDuration := preDedupDuration
 	postDedupMem := preDedupMem
-
-	// Signal workers to shut down
-	r.pool.Stop()
 
 	// Sum per-worker counters
 	r.WorkerCounters.MergeInto(&r.result.BaseMetrics)

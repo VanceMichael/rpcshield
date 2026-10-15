@@ -51,6 +51,17 @@ type WorkerPool[T any] struct {
 	numSleeping atomic.Int32
 	wakeup      chan struct{}
 
+	// cancelCh is closed once by Cancel. A closed cancelCh makes Push a
+	// no-op (no workWg.Add, no enqueue -- no new work units are accepted)
+	// and wakes every worker blocked in the sleep select so they drain
+	// already-queued items (the do callback drops them cheaply when pools
+	// are canceled) instead of waiting for producer signals. In-flight work
+	// items always run to completion, and queued items are always accounted
+	// in workWg, so Wait still converges to zero after cancellation; Stop
+	// then lets the workers exit.
+	cancelCh   chan struct{}
+	cancelOnce sync.Once
+
 	numWorkers int
 	rngs       []PaddedRand
 
@@ -69,6 +80,7 @@ func NewWorkerPool[T any](numWorkers int) *WorkerPool[T] {
 		mainbox:    chaselev.New[T](),
 		workDone:   make(chan struct{}),
 		wakeup:     make(chan struct{}, numWorkers),
+		cancelCh:   make(chan struct{}),
 		numWorkers: numWorkers,
 		rngs:       make([]PaddedRand, numWorkers),
 	}
@@ -105,8 +117,22 @@ func (p *WorkerPool[T]) WorkerRand(i int) *rand.Rand {
 //
 // Each Push increments an internal WaitGroup that is decremented after the
 // item's DoWork callback returns. Wait blocks until the counter reaches zero.
+//
+// After Cancel, Push is a no-op: the item is neither counted nor enqueued, so
+// canceled producers cannot extend the analysis with new work units and Wait
+// only has to wait for already-started items to converge.
 func (p *WorkerPool[T]) Push(item T, workerID int) {
+	if p.IsCancelled() {
+		return
+	}
 	p.workWg.Add(1)
+	// Re-check after Add: a concurrent Cancel may win while this Push is in
+	// flight. Balance the Add we just made and drop the item rather than
+	// letting canceled work reach a worker.
+	if p.IsCancelled() {
+		p.workWg.Done()
+		return
+	}
 	if workerID >= 0 {
 		p.workQueues[workerID].Push(item)
 	} else {
@@ -125,6 +151,41 @@ func (p *WorkerPool[T]) Push(item T, workerID int) {
 		case p.wakeup <- struct{}{}:
 		default:
 		}
+	}
+}
+
+// Cancel closes the pool's cancellation channel exactly once. It stops the
+// pool from accepting new work units and wakes every worker blocked in the
+// sleep select so already-queued items get drained (the do callback can skip
+// them cheaply via IsCancelled). It does NOT interrupt work items already
+// running -- those run to completion and, like drained items, balance the
+// WaitGroup as usual. Typical usage: drive Cancel from a context watcher,
+// then Wait until the pool converges, then Stop.
+func (p *WorkerPool[T]) Cancel() {
+	p.cancelOnce.Do(func() {
+		close(p.cancelCh)
+		// Wake all sleeping workers so they observe cancelCh immediately
+		// instead of waiting for a producer signal.
+		for p.numSleeping.Load() > 0 {
+			select {
+			case p.wakeup <- struct{}{}:
+			default:
+				// Surplus signals drop; workers also select on cancelCh
+				// directly and at the top of the steal loop.
+				goto done
+			}
+		}
+	done:
+	})
+}
+
+// IsCancelled reports whether Cancel has been called.
+func (p *WorkerPool[T]) IsCancelled() bool {
+	select {
+	case <-p.cancelCh:
+		return true
+	default:
+		return false
 	}
 }
 
@@ -232,6 +293,9 @@ func (p *WorkerPool[T]) workerLoop(i int) {
 
 		select {
 		case <-p.wakeup:
+			// Woken by a producer or by Cancel. Either way, loop back and
+			// drain the queues: after Cancel, the do-callback drops items
+			// cheaply while Push rejects new ones, so the pool converges.
 		case _, ok := <-p.workDone:
 			p.numSleeping.Add(-1)
 			if !ok {

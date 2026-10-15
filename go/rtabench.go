@@ -1,6 +1,7 @@
 package rpcshield
 
 import (
+	"context"
 	"slices"
 	"time"
 
@@ -13,6 +14,7 @@ import (
 // runCGConstructionOnly runs CG construction-only evaluation for benchmarking.
 // It builds the call graph without outbound detection or path analysis.
 func (d *Driver) runCGConstructionOnly(
+	ctx context.Context,
 	pkgs []*packages.Package,
 	ssaProg *ssa.Program,
 	ssaPkgs []*ssa.Package,
@@ -49,6 +51,7 @@ func (d *Driver) runCGConstructionOnly(
 		RTABenchFlavors:         rtaBenchFlavors,
 		RTABenchNumWorkers:      rtaBenchNumWorkers,
 		CheckIsomorphism:        d.opts.CheckIsomorphism,
+		Context:                 ctx,
 	}
 	d.Logger.Infow("Graph config", "config", graphConfig)
 

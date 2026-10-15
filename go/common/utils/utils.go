@@ -2,6 +2,7 @@ package utils
 
 import (
 	"bytes"
+	"context"
 	"errors"
 	"fmt"
 	"go/token"
@@ -208,6 +209,25 @@ func MergeStatus(s1 constant.Failness, s2 constant.Failness, order map[constant.
 // ExecCommand executes a command and returns its stdout or an error.
 func ExecCommand(runner Runner, name string, arg ...string) (string, string, error) {
 	cmd := exec.Command(name, arg...)
+	var stdout, stderr bytes.Buffer
+	cmd.Stdout = &stdout
+	cmd.Stderr = &stderr
+	err := runner.Run(cmd)
+	if err != nil {
+		return "", "", fmt.Errorf("failed to execute command %q %v: %w\nSTDOUT: %s\nSTDERR: %s", name, arg, err, stdout.String(), stderr.String())
+	}
+	return stdout.String(), stderr.String(), nil
+}
+
+// ExecCommandContext is ExecCommand with a cancellation context: when ctx is
+// canceled while the command is still running, os/exec kills the process
+// group member (exec.CommandContext default Cancel) and runner.Run returns a
+// context error, which is wrapped in the same shape as ExecCommand's errors.
+// Long-running target-loading commands (notably `bazel build`) therefore stop
+// consuming CPU promptly on SIGINT/SIGTERM or caller cancellation instead of
+// running to completion in the background.
+func ExecCommandContext(ctx context.Context, runner Runner, name string, arg ...string) (string, string, error) {
+	cmd := exec.CommandContext(ctx, name, arg...)
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout = &stdout
 	cmd.Stderr = &stderr

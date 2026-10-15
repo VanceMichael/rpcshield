@@ -1,0 +1,25 @@
+rubrics:
+  - id: 1
+    type: f2p
+    text: SIGINT/SIGTERM 和调用方取消 Driver.Run context 都会取消同一次 WPA 运行；目标装载、RTA、call tree 与后续路径分析停止接收新工作，并返回可由 errors.Is 识别的 context.Canceled 或 context.DeadlineExceeded。
+  - id: 2
+    type: f2p
+    text: 在并行 RTA 或 call tree worker 被确定性阻塞时取消，生产者、消费者和汇聚方均被唤醒并在 Run 返回前结束，不发生死锁、向已关闭通道发送、返回后继续修改结果或可检测的 goroutine 泄漏。
+  - id: 3
+    type: f2p
+    text: 逐路径和逐 edge 分析会在取消后停止；LLM analyzer 使用运行 context 而非 background context，使进行中的模型请求可中止，且不会继续执行剩余 edge 或 target。
+  - id: 4
+    type: f2p
+    text: 取消或 deadline 不会把多 target 已完成前缀作为成功结果，也不会用本次不完整的 result.json、CSV 或 HTML 替换输出目录中上一轮完整产物；暂存内容被清理。
+  - id: 5
+    type: f2p
+    text: 取消路径会在所有使用者退出后回收本次创建的 lifted GOPATH，不与仍在运行的装载或分析竞争；KeepGoPathAfterRun=true 时仍按既有契约保留该目录。
+  - id: 6
+    type: f2p
+    text: 取消期间已经积累的路径、analyzer 与 target metrics 不会被上报成完整服务成功；CLI 和库入口都能观察到一致的取消结果，同时不把取消误记为普通分析 verdict。
+  - id: 7
+    type: p2p
+    text: 没有取消时，现有 RTA flavor、worker 数、并行 call tree 开关、analyzer 顺序、failness 聚合、result/CSV/HTML 内容与 metrics 语义保持兼容，相关既有测试通过。
+  - id: 8
+    type: p2p
+    text: 非取消的加载、图构建、analyzer 或报告错误仍返回原有诊断并保留现有错误结果行为，不会被错误归类为取消；成功运行后原有清理和 KeepGoPathAfterRun 行为不变。

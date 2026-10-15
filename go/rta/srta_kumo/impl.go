@@ -611,8 +611,12 @@ func (a *RTA) Analyze(roots []*ssa.Function, buildCallGraph bool, opts ...rtalib
 	// Visit functions, processing their instructions, and adding
 	// new functions to the worklist, until a fixed point is
 	// reached.
+	ctx := cfg.ContextOrBackground()
 	var shadow []*ssa.Function // for efficiency, we double-buffer the worklist
 	for len(r.worklist) > 0 {
+		if ctx.Err() != nil {
+			return nil
+		}
 		shadow, r.worklist = r.worklist, shadow[:0]
 		for _, f := range shadow {
 			r.visitFunc(f)

@@ -1,6 +1,7 @@
 package graph
 
 import (
+	"context"
 	"runtime"
 	"testing"
 
@@ -426,7 +427,7 @@ func TestRunSingleFlavorCustomRTA(t *testing.T) {
 	require.NotEmpty(t, entry)
 
 	// Run SRTA (a custom flavor that goes through NewImpl).
-	cg, err := bi.runSingleFlavor(entry, FlavorSRTA, 1)
+	cg, err := bi.runSingleFlavor(context.Background(), entry, FlavorSRTA, 1)
 	require.NoError(t, err)
 	require.NotNil(t, cg)
 	assert.Greater(t, len(cg.Nodes), 0)
@@ -438,7 +439,7 @@ func TestRunSingleFlavorStdlib(t *testing.T) {
 	entry, err := bi.getRTAEntryFunctions()
 	require.NoError(t, err)
 
-	cg, err := bi.runSingleFlavor(entry, FlavorStdlib, 1)
+	cg, err := bi.runSingleFlavor(context.Background(), entry, FlavorStdlib, 1)
 	require.NoError(t, err)
 	require.NotNil(t, cg)
 	assert.Greater(t, len(cg.Nodes), 0)
@@ -450,7 +451,7 @@ func TestRunSingleFlavorCHA(t *testing.T) {
 	entry, err := bi.getRTAEntryFunctions()
 	require.NoError(t, err)
 
-	cg, err := bi.runSingleFlavor(entry, FlavorCHA, 1)
+	cg, err := bi.runSingleFlavor(context.Background(), entry, FlavorCHA, 1)
 	require.NoError(t, err)
 	require.NotNil(t, cg)
 	assert.Greater(t, len(cg.Nodes), 0)
@@ -506,10 +507,10 @@ func TestCompareCallGraphsWithRealFunctions(t *testing.T) {
 	entry, err := bi.getRTAEntryFunctions()
 	require.NoError(t, err)
 
-	cg1, err := bi.runSingleFlavor(entry, FlavorStdlib, 1)
+	cg1, err := bi.runSingleFlavor(context.Background(), entry, FlavorStdlib, 1)
 	require.NoError(t, err)
 
-	cg2, err := bi.runSingleFlavor(entry, FlavorSRTA, 1)
+	cg2, err := bi.runSingleFlavor(context.Background(), entry, FlavorSRTA, 1)
 	require.NoError(t, err)
 
 	logger := zap.NewNop().Sugar()
@@ -523,7 +524,7 @@ func TestComputeNeighborHashWithRealFunctions(t *testing.T) {
 	entry, err := bi.getRTAEntryFunctions()
 	require.NoError(t, err)
 
-	cg, err := bi.runSingleFlavor(entry, FlavorStdlib, 1)
+	cg, err := bi.runSingleFlavor(context.Background(), entry, FlavorStdlib, 1)
 	require.NoError(t, err)
 
 	bi.computeNeighborHash(cg, "stdlib", 1)

@@ -632,7 +632,8 @@ func TestDriver_AnalyzeCallPaths_Corner_Cases(t *testing.T) {
 			timestampCache:               make(map[string]string),
 			Logger:                       zap.NewNop().Sugar(),
 		}
-		results := d.analyzeCallPaths(pkgs, callPaths)
+		results, analyzeErr := d.analyzeCallPaths(context.Background(), pkgs, callPaths)
+		require.NoError(t, analyzeErr)
 		var allErrors []string
 		for _, r := range results {
 			for _, pr := range r.PathResults {
@@ -752,12 +753,12 @@ func TestDriver_LLM(t *testing.T) {
 		IdentFuncLitMap: nil,
 	}
 
-	out, err := d.runLLMAnalyzer(caller, callee, calleeObj, astContext)
+	out, err := d.runLLMAnalyzer(context.Background(), caller, callee, calleeObj, astContext)
 	require.NoError(t, err)
 	require.Equal(t, constant.FailClose, out.Status)
 
 	// Test case where the LLM API returns an error.
-	_, err = d.runLLMAnalyzer(caller, callee, nil, astContext)
+	_, err = d.runLLMAnalyzer(context.Background(), caller, callee, nil, astContext)
 	require.Error(t, err)
 }
 

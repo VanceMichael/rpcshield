@@ -1,6 +1,7 @@
 package rta
 
 import (
+	"context"
 	"sort"
 
 	"github.com/uber-research/rpcshield/go/rta/utils"
@@ -62,11 +63,27 @@ type AnalyzeOption func(*AnalyzeConfig)
 type AnalyzeConfig struct {
 	NumWorkers              int
 	MethodSelectionStrategy MethodSelectionStrategy
+
+	// Context carries cancellation into the analysis. When canceled, parallel
+	// implementations stop accepting new work items, wake any sleeping workers,
+	// let in-flight work items converge, and Analyze returns nil. Sequential
+	// implementations bail out of their worklist loops and also return nil.
+	// Callers must inspect Context.Err() (or the surrounding graph-level
+	// error) to distinguish cancellation from "no roots specified".
+	Context context.Context
+}
+
+// ContextOrBackground returns the configured context, or context.Background().
+func (c AnalyzeConfig) ContextOrBackground() context.Context {
+	if c.Context != nil {
+		return c.Context
+	}
+	return context.Background()
 }
 
 // DefaultAnalyzeConfig returns an AnalyzeConfig with defaults applied, then opts.
 func DefaultAnalyzeConfig(opts ...AnalyzeOption) AnalyzeConfig {
-	cfg := AnalyzeConfig{NumWorkers: 1, MethodSelectionStrategy: RarestMethodByConcreteType}
+	cfg := AnalyzeConfig{NumWorkers: 1, MethodSelectionStrategy: RarestMethodByConcreteType, Context: context.Background()}
 	for _, o := range opts {
 		o(&cfg)
 	}
@@ -87,6 +104,17 @@ func WithNumWorkers(n int) AnalyzeOption {
 // WithMethodSelectionStrategy sets the MI method selection strategy.
 func WithMethodSelectionStrategy(s MethodSelectionStrategy) AnalyzeOption {
 	return func(c *AnalyzeConfig) { c.MethodSelectionStrategy = s }
+}
+
+// WithContext carries a cancellation context into the RTA analysis. A
+// canceled context makes parallel pools reject new work items, wakes blocked
+// workers, and causes Analyze to return nil once in-flight items converge.
+func WithContext(ctx context.Context) AnalyzeOption {
+	return func(c *AnalyzeConfig) {
+		if ctx != nil {
+			c.Context = ctx
+		}
+	}
 }
 
 // RTA defines the contract for Rapid Type Analysis implementations.

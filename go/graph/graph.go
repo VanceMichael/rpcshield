@@ -1,6 +1,7 @@
 package graph
 
 import (
+	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"errors"
@@ -180,6 +181,14 @@ type Config struct {
 	// the wrapper-package recipe that lets a real internal package delegate to this one without
 	// requiring existing call sites to change their imports.
 	SafeGoPkgPath string
+	// Context carries caller cancellation (SIGINT/SIGTERM in the CLI, or a
+	// canceled context from library callers) through RTA, the parallel call
+	// tree, and path collection. When canceled, the builder stops launching
+	// new work, lets started goroutines/workers converge, and Build /
+	// BuildCGOnly return an error wrapping context.Canceled (or
+	// context.DeadlineExceeded). Nil defaults to context.Background(),
+	// preserving the uncanceled behavior every existing caller relies on.
+	Context context.Context
 }
 
 // builderImpl is a struct that builds a call graph from a set of packages.
@@ -309,7 +318,30 @@ func NewBuilder(logger *zap.SugaredLogger,
 	}
 }
 
+// context returns the builder's cancellation context, or context.Background()
+// when none was configured.
+func (b *builderImpl) context() context.Context {
+	if b.config.Context != nil {
+		return b.config.Context
+	}
+	return context.Background()
+}
+
+// checkCancel returns a recognizable cancellation error when the context is
+// done, otherwise nil. The returned error wraps the underlying context error
+// (context.Canceled / context.DeadlineExceeded) so errors.Is works at every
+// layer (graph, driver, CLI).
+func (b *builderImpl) checkCancel() error {
+	if err := b.context().Err(); err != nil {
+		return fmt.Errorf("graph build canceled: %w", err)
+	}
+	return nil
+}
+
 func (b *builderImpl) getCG() (*callgraph.Graph, error) {
+	if err := b.checkCancel(); err != nil {
+		return nil, err
+	}
 	// Begin clean by forcing GC.
 	runtime.GC()
 	defer runtime.GC()
@@ -331,7 +363,7 @@ func (b *builderImpl) getCG() (*callgraph.Graph, error) {
 		}
 
 		start := time.Now()
-		result, err := b.runSingleFlavor(entry, b.config.RTAFlavor, numWorkers)
+		result, err := b.runSingleFlavor(b.context(), entry, b.config.RTAFlavor, numWorkers)
 		if err != nil {
 			return nil, err
 		}
@@ -343,6 +375,11 @@ func (b *builderImpl) getCG() (*callgraph.Graph, error) {
 		b.logger.Infow("rta_construction", "rss_after_rta_construction", usage)
 		b.metrics["rss_after_rta_construction"] = float64(usage)
 		if result == nil {
+			// Distinguish cancellation (runSingleFlavor returns a nil graph
+			// with a context error) from an RTA implementation failure.
+			if err := b.checkCancel(); err != nil {
+				return nil, err
+			}
 			return nil, errors.New("RTA call graph is nil")
 		}
 
@@ -576,6 +613,9 @@ func (b *builderImpl) buildResult() *BuildResult {
 
 // getCallPathsAndCallGraph is a helper function that constructs the call graph and maps AST functions to SSA function nodes.
 func (b *builderImpl) getCallPathsAndCallGraph() ([]*CallPath, []*CallPath, *callgraph.Graph, error) {
+	if err := b.checkCancel(); err != nil {
+		return nil, nil, nil, err
+	}
 	// Compute codebase metrics first (outside of RTA timing)
 	b.computeCodebaseMetrics()
 
@@ -596,6 +636,9 @@ func (b *builderImpl) getCallPathsAndCallGraph() ([]*CallPath, []*CallPath, *cal
 	cg, err := b.getCG()
 	if err != nil {
 		b.logger.Errorf("Error getting call graph: %v", err)
+		return nil, nil, nil, err
+	}
+	if err := b.checkCancel(); err != nil {
 		return nil, nil, nil, err
 	}
 
@@ -654,11 +697,18 @@ func (b *builderImpl) getCallPathsAndCallGraph() ([]*CallPath, []*CallPath, *cal
 
 	b.synthesizeMissingInboundNodes(cg)
 
+	if err := b.checkCancel(); err != nil {
+		return nil, nil, nil, err
+	}
+
 	b.logger.Infof("Building call tree")
 	// Now get the calltree from the pruned graph.
 	cct, err := b.buildCallTree(cg)
 	if err != nil {
 		b.logger.Errorf("Error building call tree: %v", err)
+		return nil, nil, nil, err
+	}
+	if err := b.checkCancel(); err != nil {
 		return nil, nil, nil, err
 	}
 

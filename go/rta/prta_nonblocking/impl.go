@@ -4,6 +4,7 @@
 package prta_nonblocking
 
 import (
+	"context"
 	"fmt"
 	"go/types"
 	"runtime"
@@ -444,8 +445,25 @@ func (a *RTA) Analyze(roots []*ssa.Function, buildCallGraph bool, opts ...rtalib
 	r.interfaceTypes.SetHasher(hasher)
 
 	r.pool.Start(func(item workItem, workerID int) {
+		// Deduplication items always run (they return semaphore slots in
+		// doWork); queued analysis items are dropped cheaply after cancel.
+		if _, isDedup := item.(*deduplicateEdgesWorkItem); !isDedup && r.pool.IsCancelled() {
+			return
+		}
 		item.doWork(r, workerID)
 	})
+
+	// Bridge context cancellation to the worker pool: on cancel, reject new
+	// work units and wake blocked workers; Wait converges in-flight items.
+	ctx := cfg.ContextOrBackground()
+	stopWatcher := make(chan struct{})
+	go func() {
+		select {
+		case <-ctx.Done():
+			r.pool.Cancel()
+		case <-stopWatcher:
+		}
+	}()
 
 	// Add the initial work to mainbox; workers will steal from it.
 	for _, root := range roots {
@@ -459,8 +477,13 @@ func (a *RTA) Analyze(roots []*ssa.Function, buildCallGraph bool, opts ...rtalib
 	runtime.ReadMemStats(&baselineMem)
 	baselineHeapInuse := baselineMem.HeapInuse
 
-	// Wait for RTA-related work to complete
+	// Wait for the main RTA phase to converge (or be canceled).
 	r.pool.Wait()
+	if ctx.Err() != nil {
+		close(stopWatcher)
+		r.pool.Stop()
+		return nil
+	}
 
 	// Record pre-dedup timing and memory
 	preDedupDuration := time.Since(analysisStart)
@@ -469,16 +492,22 @@ func (a *RTA) Analyze(roots []*ssa.Function, buildCallGraph bool, opts ...rtalib
 
 	// Populate result callgraph
 
-	// De-duplicate edges, using the worker pool with batching
-	r.processNodesInBatches(numWorkers)
+	// De-duplicate edges, using the worker pool with batching. Stops
+	// submitting new batches if the context is canceled mid-phase.
+	r.processNodesInBatches(ctx, numWorkers)
 
 	// Record post-dedup timing and memory
 	postDedupDuration := time.Since(analysisStart)
 	var postDedupMem runtime.MemStats
 	runtime.ReadMemStats(&postDedupMem)
 
-	// Signal workers to shut down
+	close(stopWatcher)
+	// Converge any dedup items still in flight on a mid-phase cancellation.
+	r.pool.Wait()
 	r.pool.Stop()
+	if ctx.Err() != nil {
+		return nil
+	}
 
 	// Sum per-worker counters
 	r.WorkerCounters.MergeInto(&r.result.BaseMetrics)
@@ -500,7 +529,13 @@ func (a *RTA) Analyze(roots []*ssa.Function, buildCallGraph bool, opts ...rtalib
 // doubling memory usage by limiting the number of work items queued at once.
 // It uses a batch size of 2*numWorkers.
 // A buffered channel acts as both a semaphore and a slice pool.
-func (r *rta) processNodesInBatches(numWorkers int) {
+//
+// If ctx is canceled while batches are being submitted, no further batches
+// are submitted. Already-enqueued batches converge via the worker pool
+// (their doWork always returns the semaphore slot); the caller's post-phase
+// pool.Wait then confirms convergence, so this function never blocks on
+// slots belonging to dropped (never-enqueued) submissions.
+func (r *rta) processNodesInBatches(ctx context.Context, numWorkers int) {
 	batchSize := numWorkers * 2
 
 	// Create semaphore channel that holds slices for recycling
@@ -519,28 +554,42 @@ func (r *rta) processNodesInBatches(numWorkers int) {
 
 	// Process nodes directly from the map without creating an intermediate slice
 	for _, node := range cg.Nodes {
+		// Stop accepting new dedup work units after cancellation.
+		if ctx.Err() != nil {
+			return
+		}
 		batch = append(batch, node)
 
 		// When batch is full, submit it and get a new one
 		if len(batch) >= batchSize {
 			r.addToWorklist(&deduplicateEdgesWorkItem{nodes: batch, semaphore: semaphore}, -1)
 
-			// Get next slice from semaphore (blocks if all are in use)
-			batch = <-semaphore
+			// Get next slice from semaphore; unblock on cancellation since a
+			// concurrently-rejected Push will never return this slot.
+			select {
+			case batch = <-semaphore:
+			case <-ctx.Done():
+				return
+			}
 		}
 	}
 
 	// Submit remaining nodes if any
-	if len(batch) > 0 {
+	if len(batch) > 0 && ctx.Err() == nil {
 		r.addToWorklist(&deduplicateEdgesWorkItem{nodes: batch, semaphore: semaphore}, -1)
 	} else {
 		// Return unused slice to semaphore
 		semaphore <- batch
 	}
 
-	// Wait for all batches to complete by draining the semaphore
+	// Drain slots without blocking past items that actually ran; the
+	// caller's pool.Wait confirms full convergence.
 	for i := 0; i < batchSize; i++ {
-		<-semaphore
+		select {
+		case <-semaphore:
+		default:
+			return
+		}
 	}
 }
 

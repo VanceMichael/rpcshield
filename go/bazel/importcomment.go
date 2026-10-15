@@ -1,6 +1,7 @@
 package bazel
 
 import (
+	"context"
 	"fmt"
 	"go/ast"
 	"go/parser"
@@ -21,13 +22,16 @@ import (
 // Solution: explicitly remove the import comment.
 // Origin Src: package buffer // import "go.uber.org/zap/buffer"
 // Expect: package buffer
-func (br *gopathWrapper) fixImportComment(runner utils.Runner, gopathRoot string) error {
+func (br *gopathWrapper) fixImportComment(ctx context.Context, runner utils.Runner, gopathRoot string) error {
+	if err := ctx.Err(); err != nil {
+		return fmt.Errorf("fix import comment canceled: %w", err)
+	}
 	_, patherr := os.Stat(gopathRoot)
 	if os.IsNotExist(patherr) {
 		return nil
 	}
 	// By default, the folder is read-only, relax it in order to rename it.
-	if _, _, err := utils.ExecCommand(runner, "chmod", "-R", "777", gopathRoot); err != nil {
+	if _, _, err := utils.ExecCommandContext(ctx, runner, "chmod", "-R", "777", gopathRoot); err != nil {
 		return err
 	}
 

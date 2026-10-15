@@ -114,5 +114,7 @@ func TestWriteReportsToHTML_FileWriteError(t *testing.T) {
 
 	_, err := WriteReportsToHTML(invalidDir, "ServiceA", mockReports(), "abc123", "2024-11-25T15:04:05Z")
 	require.Error(t, err)
-	require.Contains(t, err.Error(), "failed to write HTML content to file")
+	// Writes are staged in a temp file in the output dir and atomically
+	// renamed into place, so the failure is at temp-file creation here.
+	require.Contains(t, err.Error(), "failed to create temp HTML file")
 }

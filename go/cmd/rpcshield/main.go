@@ -5,6 +5,7 @@
 package main
 
 import (
+	"context"
 	"flag"
 	"fmt"
 	"log"
@@ -95,10 +96,17 @@ func main() {
 		}
 
 		aiclient := genai.New(*genaiBaseURL, *genaiToken)
-		if err := jsonmode.Run(opts, aiclient); err != nil {
+		ctx, stop := signalContext(context.Background())
+		defer stop()
+		if err := jsonmode.Run(ctx, opts, aiclient); err != nil {
 			log.Fatal(err)
 		}
 	case "wpa":
+		// SIGINT/SIGTERM cancel this context, which threads through wpamode ->
+		// Driver.Run -> target loading, RTA, call tree, analyzers and LLM.
+		ctx, stop := signalContext(context.Background())
+		defer stop()
+
 		wpaFlags := flag.NewFlagSet("wpa", flag.ExitOnError)
 		service := wpaFlags.String("service", "", "name of the service to analyze")
 		workspace := wpaFlags.String("workspace", os.Getenv("WORKSPACE_ROOT"), "source code location, default is $WORKSPACE_ROOT")
@@ -202,7 +210,7 @@ func main() {
 			TierOverrides:                tierOverrides,
 			Analyzers:                    analyzersMap,
 		}
-		if _, err := wpamode.Run(opts); err != nil {
+		if _, err := wpamode.Run(ctx, opts); err != nil {
 			log.Fatalf("Error running WPA: %v", err)
 		}
 	default:

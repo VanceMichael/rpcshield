@@ -57,23 +57,27 @@ func WriteReportsToCSV(outputDir string, service grail.Service, reports []output
 	csvReports := slices.Clone(reports)
 	csvReports = append(csvReports, output.Report{ID: output.SyntheticID, Inbound: output.EndPoint{Service: service}, Status: constant.FailUnknown})
 
-	// Create a CSV file in the output directory with the name `<service>.csv`
+	// Create the CSV file in the output directory with the name `<service>.csv`.
+	// Write to a temp file in the same directory and atomically rename it
+	// into place at the end: a failed/canceled write leaves any previously
+	// generated complete CSV untouched instead of truncating it mid-write.
 	csvFilePath := filepath.Join(outputDir, fmt.Sprintf("%s.csv", service.Name))
-
-	// Open the CSV file
-	file, err := os.Create(csvFilePath)
+	tmpFile, err := os.CreateTemp(outputDir, fmt.Sprintf(".%s.csv.tmp-*", service.Name))
 	if err != nil {
-		return "", 0, fmt.Errorf("cannot create file: %v", err)
+		return "", 0, fmt.Errorf("cannot create temp file: %v", err)
 	}
-	defer file.Close()
+	tmpPath := tmpFile.Name()
+	// On any failure path, remove the temp file; the final file is only
+	// created by the rename at the end.
+	defer os.Remove(tmpPath)
 
-	writer := csv.NewWriter(file)
-	defer writer.Flush()
+	writer := csv.NewWriter(tmpFile)
 
 	var rowsSuccessfullyWritten int
 
 	// Write CSV header
 	if err := writer.Write(header); err != nil {
+		tmpFile.Close()
 		return "", 0, fmt.Errorf("cannot write header: %v", err)
 	}
 	rowsSuccessfullyWritten++
@@ -127,5 +131,23 @@ func WriteReportsToCSV(outputDir string, service grail.Service, reports []output
 		rowsSuccessfullyWritten++
 	}
 
-	return csvFilePath, rowsSuccessfullyWritten, dataErr
+	// Flush and surface any buffered write errors before the rename.
+	writer.Flush()
+	if err := writer.Error(); err != nil {
+		dataErr = errors.Join(dataErr, fmt.Errorf("flush csv: %v", err))
+	}
+	if closeErr := tmpFile.Close(); closeErr != nil {
+		dataErr = errors.Join(dataErr, fmt.Errorf("close temp csv: %v", closeErr))
+	}
+
+	// Never promote a partial/failed file over an existing complete report.
+	if dataErr != nil {
+		return "", rowsSuccessfullyWritten, dataErr
+	}
+
+	if err := os.Rename(tmpPath, csvFilePath); err != nil {
+		return "", 0, fmt.Errorf("cannot finalize csv file: %v", err)
+	}
+
+	return csvFilePath, rowsSuccessfullyWritten, nil
 }

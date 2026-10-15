@@ -42,9 +42,12 @@ type Options struct {
 	HTMLReport bool
 }
 
-// Run runs the JSON mode of rpcshield.
-func Run(opts *Options, aiclient genai.Client) error {
-	ctx := context.Background()
+// Run runs the JSON mode of rpcshield. ctx carries SIGINT/SIGTERM/caller
+// cancellation into the (potentially long) LLM call-chain analysis.
+func Run(ctx context.Context, opts *Options, aiclient genai.Client) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	logger, err := common.BuildLogger(opts.LogLevel)
 	if err != nil {
 		return fmt.Errorf("failed to build logger: %w", err)

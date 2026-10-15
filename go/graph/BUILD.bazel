@@ -56,6 +56,7 @@ go_test(
         "cct_sampling_test.go",
         "cct_test.go",
         "cffenricher_test.go",
+        "cancellation_test.go",
         "constprop_test.go",
         "contextual_test.go",
         "errgroupenricher_test.go",

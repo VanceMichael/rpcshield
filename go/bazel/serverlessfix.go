@@ -1,6 +1,7 @@
 package bazel
 
 import (
+	"context"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -18,7 +19,7 @@ var (
 // processServerlessFix fix the no main pkg issue for serverless targets
 // The general flow is to 1) build the target to generate main.go
 // and 2) copy the main.go to the synthesized analysis directory
-func (br *gopathWrapper) processServerlessFix(runner utils.Runner, target, bazelBinPath, pkgPath, gopathRoot, gopathPkgAndPath string) error {
+func (br *gopathWrapper) processServerlessFix(ctx context.Context, runner utils.Runner, target, bazelBinPath, pkgPath, gopathRoot, gopathPkgAndPath string) error {
 	targetServiceName := strings.Split(target, ":")[1]
 	// check if the target is a serverless targe
 	if !strings.HasPrefix(targetServiceName, "serverless-") {
@@ -29,7 +30,7 @@ func (br *gopathWrapper) processServerlessFix(runner utils.Runner, target, bazel
 	destPath := filepath.Join(gopathRoot, pkgPath)
 	// build the target to generate main.go
 	// TODO: find ways to only run the main.go generation logic via bazel and avoid building the entire target
-	_, _, err := utils.ExecCommand(runner, br.BazelPath, append(slices.Clone(_buildCmd), target)...)
+	_, _, err := utils.ExecCommandContext(ctx, runner, br.BazelPath, append(slices.Clone(_buildCmd), target)...)
 	if err != nil {
 		return err
 	}
@@ -47,7 +48,7 @@ func (br *gopathWrapper) processServerlessFix(runner utils.Runner, target, bazel
 	}
 
 	// copy main.go to path .../../../service-anal/src/../targetServiceName/
-	if _, _, err := utils.ExecCommand(runner, "cp", "-r", mainFile, destMainPath); err != nil {
+	if _, _, err := utils.ExecCommandContext(ctx, runner, "cp", "-r", mainFile, destMainPath); err != nil {
 		return fmt.Errorf("failed to copy generated main from %q to %q: %w", generatedMainPath, destPath, err)
 	}
 

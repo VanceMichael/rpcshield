@@ -1,6 +1,7 @@
 package graph
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"runtime"
@@ -90,7 +91,12 @@ func (b *builderImpl) buildCallTree(graph *callgraph.Graph) (map[*ssa.Function]*
 	resultChan := make(chan workerResult, len(b.inboundsSSA))
 
 	// Worker function that processes a single source
-	processSource := func(src inbound) {
+	ctx := b.context()
+	processSource := func(src inbound) error {
+		// Never start exploring a new source after cancellation.
+		if err := ctx.Err(); err != nil {
+			return err
+		}
 		if b.isDebugEnabled() {
 			b.logger.Debugf("Building call tree for source function %s", src.function.String())
 		}
@@ -105,7 +111,7 @@ func (b *builderImpl) buildCallTree(graph *callgraph.Graph) (map[*ssa.Function]*
 			cfg.MaxFunctionVisits = b.config.MaxFunctionVisits
 		}
 		expState := newExplorationStateWithConfig(cfg)
-		root, err := b.buildCallTreeNode(src.function, sinkSet, graph, visited, nil, localMetrics, expState)
+		root, err := b.buildCallTreeNode(ctx, src.function, sinkSet, graph, visited, nil, localMetrics, expState)
 
 		// Collect per-IB exploration data
 		exploration := expState.Metrics(sinkCanonicalNames)
@@ -154,6 +160,12 @@ func (b *builderImpl) buildCallTree(graph *callgraph.Graph) (map[*ssa.Function]*
 			resultGraph = nil
 		}
 
+		// A cancellation during exploration overrides partial sub-errors:
+		// the whole build is being abandoned.
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return ctxErr
+		}
+
 		// Send result (even if there was an error, send partial results and metrics)
 		resultChan <- workerResult{
 			fn:          src.function,
@@ -162,13 +174,21 @@ func (b *builderImpl) buildCallTree(graph *callgraph.Graph) (map[*ssa.Function]*
 			err:         err,
 			exploration: exploration,
 		}
+		return nil
 	}
 
 	if b.config.DisableParallelCallTree {
 		// Sequential mode: process sources one by one
 		b.logger.Info("Using sequential call tree computation")
 		for _, source := range b.inboundsSSA {
-			processSource(source)
+			if err := processSource(source); err != nil {
+				// Cancellation: stop launching new sources; workers below have
+				// nothing to wait for in sequential mode.
+				if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+					close(resultChan)
+					return nil, fmt.Errorf("graph build canceled: %w", err)
+				}
+			}
 		}
 		close(resultChan)
 	} else {
@@ -176,15 +196,24 @@ func (b *builderImpl) buildCallTree(graph *callgraph.Graph) (map[*ssa.Function]*
 		b.logger.Info("Using parallel call tree computation")
 		var wg sync.WaitGroup
 		for _, source := range b.inboundsSSA {
+			// Stop accepting new source-exploration work units once canceled.
+			if err := ctx.Err(); err != nil {
+				break
+			}
 			wg.Add(1)
 			go func(src inbound) {
 				defer wg.Done()
-				processSource(src)
+				_ = processSource(src)
 			}(source)
 		}
-		// Wait for all goroutines to complete
+		// Wait for all launched goroutines to converge (in-flight explorations
+		// bail out at the next node/edge/SCCP check; partial results already
+		// sent are ignored by the caller's post-Wait cancellation check).
 		wg.Wait()
 		close(resultChan)
+		if err := ctx.Err(); err != nil {
+			return nil, fmt.Errorf("graph build canceled: %w", err)
+		}
 	}
 
 	// Merge all results, metrics, and collect errors
@@ -235,7 +264,12 @@ func (b *builderImpl) buildCallTree(graph *callgraph.Graph) (map[*ssa.Function]*
 // The caller and callsite in the first edge from in the source function.
 // THe callee in the last edge contains a sink
 // The result checks against every sink sinkCallSites and returns a filtered set of feasible callsite in the given path.
-func (b *builderImpl) checkPathFeasibility(path []*callgraph.Edge, sinkCallSites []ssa.CallInstruction, metrics map[string]float64) ([]ssa.CallInstruction, error) {
+func (b *builderImpl) checkPathFeasibility(ctx context.Context, path []*callgraph.Edge, sinkCallSites []ssa.CallInstruction, metrics map[string]float64) ([]ssa.CallInstruction, error) {
+	// SCCP is the expensive part of sink feasibility; skip it entirely on
+	// cancellation (caller treats the sink infeasible and aborts the tree).
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	if b.config.DisableSCCPAnalysis {
 		b.logger.Infow("checkPathFeasibility", "sccp_analysis_disabled", "returning all sink call sites")
 		return sinkCallSites, nil
@@ -266,6 +300,7 @@ func (b *builderImpl) checkPathFeasibility(path []*callgraph.Edge, sinkCallSites
 
 // buildCallTreeNode recursively builds the call tree node for a given function.
 func (b *builderImpl) buildCallTreeNode(
+	ctx context.Context,
 	fn *ssa.Function,
 	sinkSet map[*ssa.Function][]ssa.CallInstruction,
 	graph *callgraph.Graph,
@@ -274,6 +309,11 @@ func (b *builderImpl) buildCallTreeNode(
 	metrics map[string]float64,
 	expState *explorationState,
 ) (*callgraph.Node, error) {
+	// Cancellation takes precedence over every other early-return: the
+	// enclosing source worker stops exploring and converges immediately.
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	// Check if the function is already in the current path.
 	if _, ok := path[fn]; ok {
 		return nil, nil // Function repeats on this path; do not include it again.
@@ -327,7 +367,7 @@ func (b *builderImpl) buildCallTreeNode(
 			Callee: nil, // No callee for a sink.
 		}
 
-		feasibleCallSites, err := b.checkPathFeasibility(curStack, callsites, metrics)
+		feasibleCallSites, err := b.checkPathFeasibility(ctx, curStack, callsites, metrics)
 		// No mutex needed - each shard has its own independent metrics map
 		metrics[_constpropCandidatePaths] += float64(len(callsites))
 		metrics[_constpropFeasiblePaths] += float64(len(feasibleCallSites))
@@ -356,6 +396,11 @@ func (b *builderImpl) buildCallTreeNode(
 	hasChildren := false
 	b.logger.Debugf("num outgoing edges: %d", len(origNode.Out))
 	for _, edge := range origNode.Out {
+		// Bail out promptly when canceled rather than exploring the rest of
+		// the (potentially huge) fan-out; the caller waits for this return.
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
 		calleeFn := edge.Callee.Func
 		if slices.Contains(sinkSet[fn], edge.Site) {
 			continue // skip the callee that is a sink call site.
@@ -373,7 +418,7 @@ func (b *builderImpl) buildCallTreeNode(
 		// It is critical to use the edge from the original graph, not the one created in the call tree.
 		// This is because we will use dontPruneEdges to check if the edge should be pruned.
 		curStack[len(curStack)-1] = edge
-		childNode, err := b.buildCallTreeNode(calleeFn, sinkSet, graph, path, curStack, metrics, expState)
+		childNode, err := b.buildCallTreeNode(ctx, calleeFn, sinkSet, graph, path, curStack, metrics, expState)
 		if err != nil {
 			return nil, err
 		}

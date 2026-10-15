@@ -1,0 +1,3420 @@
+diff --git a/go/BUILD.bazel b/go/BUILD.bazel
+index 1c7015d..7798653 100644
+--- a/go/BUILD.bazel
++++ b/go/BUILD.bazel
+@@ -62,6 +62,7 @@ go_library(
+ go_test(
+     name = "go_default_test",
+     srcs = [
++        "cancel_test.go",
+         "driver_test.go",
+         "rtabench_test.go",
+     ],
+diff --git a/go/bazel/bazel.go b/go/bazel/bazel.go
+index 2b112e9..0edbc9a 100644
+--- a/go/bazel/bazel.go
++++ b/go/bazel/bazel.go
+@@ -1,6 +1,7 @@
+ package bazel
+ 
+ import (
++	"context"
+ 	"errors"
+ 	"fmt"
+ 	"io/fs"
+@@ -62,10 +63,20 @@ type gopathWrapper struct {
+ 	Config        config.Config
+ }
+ 
+-// LiftGoPath takes the given target and runs bazel to lift the target, as well as its transitive
+-// dependencies to form a GOPATH-like structure. The returned string is the path to the absolute
+-// lifted directory that is readily available for running analysis and a set of C/C++ library dependencies of the target.
++// LiftGoPath keeps the uncanceled entrypoint required by the GoPathWrapper
++// interface. New callers should use LiftGoPathContext.
+ func (br *gopathWrapper) LiftGoPath(runner utils.Runner, target string) (string, []string, error) {
++	return br.LiftGoPathContext(context.Background(), runner, target)
++}
++
++// LiftGoPathContext is the cancellation-aware variant of LiftGoPath: every
++// bazel/buildozer sub-command it spawns is bound to ctx, so a canceled run
++// (SIGINT/SIGTERM at the CLI, a canceled library context) kills the in-flight
++// `bazel build` instead of waiting it out. The BUILD.bazel write-back defer
++// still runs, and the partially-lifted directory is returned on cancellation
++// so the driver's GOPATH cleanup (which is registered regardless of lift
++// outcome) can remove it.
++func (br *gopathWrapper) LiftGoPathContext(ctx context.Context, runner utils.Runner, target string) (string, []string, error) {
+ 	// Check if bazel and buildozer are available.
+ 	if err := checkCommandAvailable(runner, br.BazelPath); err != nil {
+ 		return "", nil, err
+@@ -106,14 +117,14 @@ func (br *gopathWrapper) LiftGoPath(runner utils.Runner, target string) (string,
+ 	// Regex to match def.bzl.*"go_path" the BUILD.bazel file.
+ 	if !goPathRegex.Match(data) {
+ 		// Ensure go_path is loaded
+-		_, _, err = utils.ExecCommand(runner, br.BuildozerPath, "new_load @io_bazel_rules_go//go:def.bzl go_path", tgtWithPkg)
++		_, _, err = utils.ExecCommandContext(ctx, runner, br.BuildozerPath, "new_load @io_bazel_rules_go//go:def.bzl go_path", tgtWithPkg)
+ 		if err != nil {
+ 			return "", nil, err
+ 		}
+ 	}
+ 
+ 	// Add go_path rule
+-	_, _, err = utils.ExecCommand(runner, br.BuildozerPath, fmt.Sprintf("new go_path %s-anal", targetName), tgtWithPkg)
++	_, _, err = utils.ExecCommandContext(ctx, runner, br.BuildozerPath, fmt.Sprintf("new go_path %s-anal", targetName), tgtWithPkg)
+ 	// If the rule already exists, ignore the error.
+ 	if err != nil && !strings.Contains(err.Error(), "already exists") {
+ 		return "", nil, err
+@@ -126,34 +137,26 @@ func (br *gopathWrapper) LiftGoPath(runner utils.Runner, target string) (string,
+ 
+ 	gopathPkgAndPath := "//" + pkgPath + ":" + goPathTgtName
+ 	// Set testonly and include_data attributes
+-	_, _, err = utils.ExecCommand(runner, br.BuildozerPath, "set testonly True", gopathPkgAndPath)
++	_, _, err = utils.ExecCommandContext(ctx, runner, br.BuildozerPath, "set testonly True", gopathPkgAndPath)
+ 	if err != nil && !(errors.As(err, &exitErr) && exitErr.ExitCode() == 3) {
+ 		return "", nil, err
+ 	}
+-	_, _, err = utils.ExecCommand(runner, br.BuildozerPath, "set include_data False", gopathPkgAndPath)
++	_, _, err = utils.ExecCommandContext(ctx, runner, br.BuildozerPath, "set include_data False", gopathPkgAndPath)
+ 	if err != nil && !(errors.As(err, &exitErr) && exitErr.ExitCode() == 3) {
+ 		return "", nil, err
+ 	}
+ 
+ 	// Set deps attribute.
+-	_, _, err = utils.ExecCommand(runner, br.BuildozerPath, fmt.Sprintf("add deps :%s", targetName), gopathPkgAndPath)
++	_, _, err = utils.ExecCommandContext(ctx, runner, br.BuildozerPath, fmt.Sprintf("add deps :%s", targetName), gopathPkgAndPath)
+ 	if err != nil && !(errors.As(err, &exitErr) && exitErr.ExitCode() == 3) {
+ 		return "", nil, err
+ 	}
+ 
+-	// Run Bazel to build the target-anal.
+-	stdout, stderr, err := utils.ExecCommand(runner, br.BazelPath, append(slices.Clone(_buildCmd), gopathPkgAndPath)...)
+-	if err != nil {
+-		return "", nil, err
+-	}
+-	buildLogPath := filepath.Join(br.OutputDir, fmt.Sprintf("%s_bazel_build.log", br.ServiceName))
+-	br.Logger.Infow("Writing bazel build log", "path", buildLogPath)
+-	if err := os.WriteFile(buildLogPath, []byte(fmt.Sprintf("STDOUT: %s\n\nSTDERR:%s", stdout, stderr)), 0666); err != nil {
+-		return "", nil, fmt.Errorf("failed to write bazel build log to %q: %w", buildLogPath, err)
+-	}
+-
+-	// Get the path to the root of the `bazel-bin` directory.
+-	bazelBinPath, _, err := utils.ExecCommand(runner, br.BazelPath, "info", "bazel-bin")
++	// Get the path to the root of the `bazel-bin` directory up front, so a
++	// canceled/failed `bazel build` still knows the (partial) go_path tree's
++	// location for cleanup. This is the same `bazel info` the old code ran
++	// after the build -- merely reordered.
++	bazelBinPath, _, err := utils.ExecCommandContext(ctx, runner, br.BazelPath, "info", "bazel-bin")
+ 	if err != nil {
+ 		return "", nil, err
+ 	}
+@@ -162,28 +165,50 @@ func (br *gopathWrapper) LiftGoPath(runner utils.Runner, target string) (string,
+ 	// Construct the GOPATH-root directory from target and bazel-bin path.
+ 	gopathRoot := filepath.Join(bazelBinPath, pkgPath, goPathTgtName)
+ 
+-	err = br.processServerlessFix(runner, target, bazelBinPath, pkgPath, gopathRoot, gopathPkgAndPath)
++	// Run Bazel to build the target-anal.
++	stdout, stderr, err := utils.ExecCommandContext(ctx, runner, br.BazelPath, append(slices.Clone(_buildCmd), gopathPkgAndPath)...)
+ 	if err != nil {
++		// On cancellation the partial go_path tree may already exist; return
++		// its prospective path so the caller can schedule cleanup on it.
++		if ctxErr := ctx.Err(); ctxErr != nil {
++			return gopathRoot, nil, fmt.Errorf("lift GOPATH canceled: %w", ctxErr)
++		}
+ 		return "", nil, err
+ 	}
++	buildLogPath := filepath.Join(br.OutputDir, fmt.Sprintf("%s_bazel_build.log", br.ServiceName))
++	br.Logger.Infow("Writing bazel build log", "path", buildLogPath)
++	if err := os.WriteFile(buildLogPath, []byte(fmt.Sprintf("STDOUT: %s\n\nSTDERR:%s", stdout, stderr)), 0666); err != nil {
++		return gopathRoot, nil, fmt.Errorf("failed to write bazel build log to %q: %w", buildLogPath, err)
++	}
++
++	err = br.processServerlessFix(ctx, runner, target, bazelBinPath, pkgPath, gopathRoot, gopathPkgAndPath)
++	if err != nil {
++		return gopathRoot, nil, err
++	}
+ 
+ 	if err := br.patchIncorrectMoneyIntegrationGogoprotoDir(gopathRoot); err != nil {
+-		return "", nil, fmt.Errorf("patch missing money integration test file: %w", err)
++		return gopathRoot, nil, fmt.Errorf("patch missing money integration test file: %w", err)
+ 	}
+ 
++	// The renamer is CPU-bound but bounded and its output tree is deleted by
++	// the driver on cancellation; check ctx before starting so a canceled run
++	// skips straight to cleanup rather than rewriting the tree first.
++	if err := ctx.Err(); err != nil {
++		return gopathRoot, nil, fmt.Errorf("lift GOPATH canceled: %w", err)
++	}
+ 	if err := br.renamer.Rename(gopathRoot, gopathRoot); err != nil {
+-		return "", nil, err
++		return gopathRoot, nil, err
+ 	}
+ 
+ 	// Extract CGO flags, if any, by analyzing the C/C++ dependencies ("cdeps") of the target.
+-	cdeps, err := br.processCGo(runner, target, gopathRoot)
++	cdeps, err := br.processCGo(ctx, runner, target, gopathRoot)
+ 	if err != nil {
+-		return "", nil, err
++		return gopathRoot, cdeps, err
+ 	}
+ 
+ 	// Fix import comment of the package.
+-	if err := br.fixImportComment(runner, gopathRoot); err != nil {
+-		return "", nil, err
++	if err := br.fixImportComment(ctx, runner, gopathRoot); err != nil {
++		return gopathRoot, nil, err
+ 	}
+ 
+ 	return gopathRoot, cdeps, nil
+diff --git a/go/bazel/cgo.go b/go/bazel/cgo.go
+index 0b91252..8b9a625 100644
+--- a/go/bazel/cgo.go
++++ b/go/bazel/cgo.go
+@@ -2,6 +2,7 @@ package bazel
+ 
+ import (
+ 	"bufio"
++	"context"
+ 	"encoding/json"
+ 	"fmt"
+ 	"os"
+@@ -134,17 +135,18 @@ type Attribute struct {
+ //     ...
+ // )
+ 
+-func (br *gopathWrapper) processCGo(runner utils.Runner, target string, gopathRoot string) ([]string, error) {
++func (br *gopathWrapper) processCGo(ctx context.Context, runner utils.Runner, target string, gopathRoot string) ([]string, error) {
+ 	// Fetch all cc_library (C++) dependencies (direct and transitive) of target
+ 	br.Logger.Infow("processCGo", "target", target)
+ 
+-	ccOut, _, err := utils.ExecCommand(runner, br.BazelPath, "query", "--output=label", fmt.Sprintf("kind(cc_library, deps(%s))", target))
++	ccOut, _, err := utils.ExecCommandContext(ctx, runner, br.BazelPath, "query", "--output=label", fmt.Sprintf("kind(cc_library, deps(%s))", target))
+ 	if err != nil {
+ 		return nil, err
+ 	}
+ 	ccLibs := strings.Split(strings.TrimSpace(string(ccOut)), "\n")
+ 	// Handle C/C++ library built as `go_library`
+-	ccOutGoDeps, _, err := utils.ExecCommand(
++	ccOutGoDeps, _, err := utils.ExecCommandContext(
++		ctx,
+ 		runner,
+ 		br.BazelPath,
+ 		"query",
+@@ -162,7 +164,7 @@ func (br *gopathWrapper) processCGo(runner utils.Runner, target string, gopathRo
+ 	clibFilesMap := make(map[string][]string)
+ 	clibSrcPathMap := make(map[string]string)
+ 	if len(goCLibs) > 0 {
+-		ccLibs1, localClibFilesMap, localclibLocationPath, err := br.getDependentCLibs(runner, goCLibs)
++		ccLibs1, localClibFilesMap, localclibLocationPath, err := br.getDependentCLibs(ctx, runner, goCLibs)
+ 		if err != nil {
+ 			return nil, fmt.Errorf("failed to get lower c lib for: %w", err)
+ 		}
+@@ -176,17 +178,21 @@ func (br *gopathWrapper) processCGo(runner utils.Runner, target string, gopathRo
+ 		if len(ccLib) == 0 {
+ 			continue
+ 		}
++		// Stop issuing new cquery/chmod work once canceled.
++		if err := ctx.Err(); err != nil {
++			return nil, fmt.Errorf("process cgo canceled: %w", err)
++		}
+ 		// Retrieve detailed build information about the cc_library target in JSON format.
+-		resp, err := br.configQuery(runner, ccLib)
++		resp, err := br.configQuery(ctx, runner, ccLib)
+ 		if err != nil {
+ 			return nil, fmt.Errorf("failed to get cquery output for %s: %w", ccLib, err)
+ 		}
+-		err = br.preProcessCgoPkgConfig(runner, ccLib, gopathRoot, clibFilesMap, clibSrcPathMap)
++		err = br.preProcessCgoPkgConfig(ctx, runner, ccLib, gopathRoot, clibFilesMap, clibSrcPathMap)
+ 		if err != nil {
+ 			return nil, fmt.Errorf("failed to preprocess cgo pkg-config for %s: %w", ccLib, err)
+ 		}
+ 
+-		err = br.processCqueryResponse(runner, resp, &iFlagsSlice, iFlagDedup, gopathRoot)
++		err = br.processCqueryResponse(ctx, runner, resp, &iFlagsSlice, iFlagDedup, gopathRoot)
+ 		if err != nil {
+ 			return nil, fmt.Errorf("failed to process cquery response for %s: %w", ccLib, err)
+ 		}
+@@ -221,7 +227,7 @@ func (br *gopathWrapper) processCGo(runner utils.Runner, target string, gopathRo
+ //	visibility = ["//visibility:public"],
+ //
+ // )
+-func (br *gopathWrapper) preProcessCgoPkgConfig(runner utils.Runner, ccLib, gopathRoot string, clibFilesMap map[string][]string, clibSrcPathMap map[string]string) error {
++func (br *gopathWrapper) preProcessCgoPkgConfig(ctx context.Context, runner utils.Runner, ccLib, gopathRoot string, clibFilesMap map[string][]string, clibSrcPathMap map[string]string) error {
+ 	srcsGoFiles, _ := clibFilesMap[ccLib]
+ 	clibSrcPath := clibSrcPathMap[ccLib]
+ 	// Remove cgo pkg-config lines.
+@@ -247,7 +253,7 @@ func (br *gopathWrapper) preProcessCgoPkgConfig(runner utils.Runner, ccLib, gopa
+ 		// br.Logger.Debugw("clibSrcPath", "clibSrcPath", clibSrcPath)
+ 		// br.Logger.Debugw("importPath", "importPath", importPath)
+ 		// br.Logger.Debugw("srcGoFilePath", "srcGoFilePath", srcGoFilePath)
+-		if _, _, err := utils.ExecCommand(runner, "chmod", "-R", "777", srcGoFile); err != nil {
++		if _, _, err := utils.ExecCommandContext(ctx, runner, "chmod", "-R", "777", srcGoFile); err != nil {
+ 			return fmt.Errorf("failed to make %q writable: %w", srcGoFile, err)
+ 		}
+ 		err = removeCgoPkgConfigLinesFromFile(srcGoFile)
+@@ -258,7 +264,7 @@ func (br *gopathWrapper) preProcessCgoPkgConfig(runner utils.Runner, ccLib, gopa
+ 	return nil
+ }
+ 
+-func (br *gopathWrapper) getDependentCLibs(runner utils.Runner, goCLibs []string) ([]string, map[string][]string, map[string]string, error) {
++func (br *gopathWrapper) getDependentCLibs(ctx context.Context, runner utils.Runner, goCLibs []string) ([]string, map[string][]string, map[string]string, error) {
+ 	// Get all cc_library and corresponding source files and location path.
+ 	allclibs := make([]string, 0)
+ 	clibFilesMap := make(map[string][]string)
+@@ -267,7 +273,7 @@ func (br *gopathWrapper) getDependentCLibs(runner utils.Runner, goCLibs []string
+ 		if goCLib == "" {
+ 			continue
+ 		}
+-		resp, err := br.configQuery(runner, goCLib)
++		resp, err := br.configQuery(ctx, runner, goCLib)
+ 		if err != nil {
+ 			return nil, nil, nil, fmt.Errorf("failed to get cquery output for %s: %w", goCLib, err)
+ 		}
+@@ -323,7 +329,7 @@ func (br *gopathWrapper) cqueryMine(runner utils.Runner, resp CqueryResponse) ([
+ 	return clibs, clibSrcGoFiles, clibLocationPath, nil
+ }
+ 
+-func (br *gopathWrapper) processCCLibrary(runner utils.Runner, rule Rule, libLocationPath string, iFlagsSlice *[]string, iFlagDedup map[string]bool, gopathRoot string) error {
++func (br *gopathWrapper) processCCLibrary(ctx context.Context, runner utils.Runner, rule Rule, libLocationPath string, iFlagsSlice *[]string, iFlagDedup map[string]bool, gopathRoot string) error {
+ 	br.Logger.Debugw("process cquery response cc_library", "clibName", rule.Name)
+ 	// To avoid order of the attributes, iterate N times.
+ 	for _, attr := range rule.Attributes {
+@@ -355,7 +361,7 @@ func (br *gopathWrapper) processCCLibrary(runner utils.Runner, rule Rule, libLoc
+ 			// Copy the raw cc_library source/header files explicitly to the lifted path location.
+ 			// This is required because `bazel build --remote_download_all` does not download the raw cc_library files.
+ 			if isRawSrcsOrHdrs(attr) {
+-				depPath, err := br.copySrcHdrFiles(runner, libLocationPath, gopathRoot, includePrefix)
++				depPath, err := br.copySrcHdrFiles(ctx, runner, libLocationPath, gopathRoot, includePrefix)
+ 				if err != nil {
+ 					return fmt.Errorf("copySrcHdrFiles fail: %w", err)
+ 				}
+@@ -370,7 +376,7 @@ func (br *gopathWrapper) processCCLibrary(runner utils.Runner, rule Rule, libLoc
+ 		}
+ 	} else {
+ 		//Handle external CGO-cc_library
+-		err := br.extractBazelGenIncPath(runner, rule, iFlagsSlice, iFlagDedup, gopathRoot, includePrefix)
++		err := br.extractBazelGenIncPath(ctx, runner, rule, iFlagsSlice, iFlagDedup, gopathRoot, includePrefix)
+ 		if err != nil {
+ 			return fmt.Errorf("failed to extract bazel gen inc path: %w", err)
+ 		}
+@@ -378,17 +384,17 @@ func (br *gopathWrapper) processCCLibrary(runner utils.Runner, rule Rule, libLoc
+ 	return nil
+ }
+ 
+-func (br *gopathWrapper) extractBazelGenIncPath(runner utils.Runner, rule Rule, iFlagsSlice *[]string, iFlagDedup map[string]bool, gopathRoot, includePrefix string) error {
++func (br *gopathWrapper) extractBazelGenIncPath(ctx context.Context, runner utils.Runner, rule Rule, iFlagsSlice *[]string, iFlagDedup map[string]bool, gopathRoot, includePrefix string) error {
+ 	// To generate necessary header files via parsing bazel build output
+ 	// 1. build external target
+-	_, _, err := utils.ExecCommand(runner, br.BazelPath, "build", rule.Name)
++	_, _, err := utils.ExecCommandContext(ctx, runner, br.BazelPath, "build", rule.Name)
+ 	if err != nil {
+ 		return err
+ 	}
+ 	// 2. parse bazel build output
+ 	// The output is a list of files generated by the build
+ 	// Example: {bazel-out/k8-fastbuild/bin/external/libpostal/libscanner.a\nbazel-out/k8-fastbuild/bin/external/libpostal/libscanner.so\n}
+-	outlist, _, err := utils.ExecCommand(runner, br.BazelPath, "cquery", rule.Name, "--output=starlark",
++	outlist, _, err := utils.ExecCommandContext(ctx, runner, br.BazelPath, "cquery", rule.Name, "--output=starlark",
+ 		`--starlark:expr="\n".join([f.path for f in target.files.to_list()])`)
+ 	if err != nil {
+ 		return err
+@@ -409,7 +415,7 @@ func (br *gopathWrapper) extractBazelGenIncPath(runner utils.Runner, rule Rule,
+ 			genIncPath[out] = 0 // if out is target, use the target path, all the files are in the target path.
+ 		}
+ 	}
+-	bazelOutPath, _, err := utils.ExecCommand(runner, br.BazelPath, "info", "output_path")
++	bazelOutPath, _, err := utils.ExecCommandContext(ctx, runner, br.BazelPath, "info", "output_path")
+ 	if err != nil {
+ 		return err
+ 	}
+@@ -449,7 +455,7 @@ func (br *gopathWrapper) extractBazelGenIncPath(runner utils.Runner, rule Rule,
+ 	return nil
+ }
+ 
+-func (br *gopathWrapper) processCMake(runner utils.Runner, rule Rule, iFlagsSlice *[]string, iFlagDedup map[string]bool, gopathRoot string) error {
++func (br *gopathWrapper) processCMake(ctx context.Context, runner utils.Runner, rule Rule, iFlagsSlice *[]string, iFlagDedup map[string]bool, gopathRoot string) error {
+ 	br.Logger.Debugw("process cquery response using CMAKE", "clibName", rule.Name)
+ 	var includePrefix string
+ 	for _, attr := range rule.Attributes {
+@@ -457,14 +463,14 @@ func (br *gopathWrapper) processCMake(runner utils.Runner, rule Rule, iFlagsSlic
+ 			includePrefix = attr.StringValue
+ 		}
+ 	}
+-	err := br.extractBazelGenIncPath(runner, rule, iFlagsSlice, iFlagDedup, gopathRoot, includePrefix)
++	err := br.extractBazelGenIncPath(ctx, runner, rule, iFlagsSlice, iFlagDedup, gopathRoot, includePrefix)
+ 	if err != nil {
+ 		return fmt.Errorf("failed to extract bazel gen inc path: %w", err)
+ 	}
+ 	return nil
+ }
+ 
+-func (br *gopathWrapper) processConfigureMake(runner utils.Runner, rule Rule, iFlagsSlice *[]string, iFlagDedup map[string]bool, gopathRoot string) error {
++func (br *gopathWrapper) processConfigureMake(ctx context.Context, runner utils.Runner, rule Rule, iFlagsSlice *[]string, iFlagDedup map[string]bool, gopathRoot string) error {
+ 	br.Logger.Debugw("process cquery response using CONFIGURE", "clibName", rule.Name)
+ 	var includePrefix string
+ 	for _, attr := range rule.Attributes {
+@@ -472,14 +478,14 @@ func (br *gopathWrapper) processConfigureMake(runner utils.Runner, rule Rule, iF
+ 			includePrefix = attr.StringValue
+ 		}
+ 	}
+-	err := br.extractBazelGenIncPath(runner, rule, iFlagsSlice, iFlagDedup, gopathRoot, includePrefix)
++	err := br.extractBazelGenIncPath(ctx, runner, rule, iFlagsSlice, iFlagDedup, gopathRoot, includePrefix)
+ 	if err != nil {
+ 		return fmt.Errorf("failed to extract bazel gen inc path: %w", err)
+ 	}
+ 	return nil
+ }
+ 
+-func (br *gopathWrapper) processCqueryResponse(runner utils.Runner, resp CqueryResponse, iFlagsSlice *[]string, iFlagDedup map[string]bool, gopathRoot string) error {
++func (br *gopathWrapper) processCqueryResponse(ctx context.Context, runner utils.Runner, resp CqueryResponse, iFlagsSlice *[]string, iFlagDedup map[string]bool, gopathRoot string) error {
+ 	// Iterate over each of the results and process the cquery response.
+ 	for _, r := range resp.Results {
+ 		rule := r.Target.Rule
+@@ -496,19 +502,19 @@ func (br *gopathWrapper) processCqueryResponse(runner utils.Runner, resp CqueryR
+ 			if strings.Contains(rule.Name, "@bazel_tools//") {
+ 				continue
+ 			}
+-			err := br.processCCLibrary(runner, rule, libLocationPath, iFlagsSlice, iFlagDedup, gopathRoot)
++			err := br.processCCLibrary(ctx, runner, rule, libLocationPath, iFlagsSlice, iFlagDedup, gopathRoot)
+ 			if err != nil {
+ 				br.Logger.Errorf("failed to process cc_library: %w", err)
+ 				return err
+ 			}
+ 		case "cmake":
+-			err := br.processCMake(runner, rule, iFlagsSlice, iFlagDedup, gopathRoot)
++			err := br.processCMake(ctx, runner, rule, iFlagsSlice, iFlagDedup, gopathRoot)
+ 			if err != nil {
+ 				br.Logger.Errorf("failed to process cmake: %w", err)
+ 				return err
+ 			}
+ 		case "configure_make":
+-			err := br.processConfigureMake(runner, rule, iFlagsSlice, iFlagDedup, gopathRoot)
++			err := br.processConfigureMake(ctx, runner, rule, iFlagsSlice, iFlagDedup, gopathRoot)
+ 			if err != nil {
+ 				br.Logger.Errorf("failed to process configure: %w", err)
+ 				return err
+@@ -520,11 +526,11 @@ func (br *gopathWrapper) processCqueryResponse(runner utils.Runner, resp CqueryR
+ 	return nil
+ }
+ 
+-func (br *gopathWrapper) configQuery(runner utils.Runner, ccLib string) (CqueryResponse, error) {
++func (br *gopathWrapper) configQuery(ctx context.Context, runner utils.Runner, ccLib string) (CqueryResponse, error) {
+ 	var resp CqueryResponse
+ 	// Retrieve detailed build information about the cc_library target in JSON format.
+ 	br.Logger.Debugw("run configQuery", "ccLib", ccLib)
+-	ccLibInfo, _, err := utils.ExecCommand(runner, br.BazelPath, "cquery", "--output=jsonproto", fmt.Sprintf("%s", ccLib))
++	ccLibInfo, _, err := utils.ExecCommandContext(ctx, runner, br.BazelPath, "cquery", "--output=jsonproto", fmt.Sprintf("%s", ccLib))
+ 	if err != nil {
+ 		return resp, fmt.Errorf("failed to get cquery output for %s: %w", ccLib, err)
+ 	}
+@@ -571,7 +577,7 @@ func getNormalizedIFlag(depRoot, flag string) (string, bool) {
+ }
+ 
+ // copySrcHdrFiles copies the raw cc_library rule to the lifted path location. It returns the path of the copied files and an error, if any.
+-func (br *gopathWrapper) copySrcHdrFiles(runner utils.Runner, libLocationPath, gopathRoot, includePrefix string) (string, error) {
++func (br *gopathWrapper) copySrcHdrFiles(ctx context.Context, runner utils.Runner, libLocationPath, gopathRoot, includePrefix string) (string, error) {
+ 	var finalDestPath string
+ 	// handle internal dependency
+ 	// Consider the example below to understand the input and output paths:
+@@ -587,15 +593,15 @@ func (br *gopathWrapper) copySrcHdrFiles(runner utils.Runner, libLocationPath, g
+ 		return "", fmt.Errorf("raw cc_library rule not found in monorepo: %s", libLocationPath)
+ 	}
+ 	// By default, the folder is read-only, relax it in order to rename it.
+-	if _, _, err := utils.ExecCommand(runner, "chmod", "-R", "777", gopathRoot); err != nil {
++	if _, _, err := utils.ExecCommandContext(ctx, runner, "chmod", "-R", "777", gopathRoot); err != nil {
+ 		return "", fmt.Errorf("failed to make %q writable: %w", gopathRoot, err)
+ 	}
+ 
+ 	// Copy the raw cc_library rule to the lifted path location.
+-	if _, _, err := utils.ExecCommand(runner, "mkdir", "-p", destPath); err != nil {
++	if _, _, err := utils.ExecCommandContext(ctx, runner, "mkdir", "-p", destPath); err != nil {
+ 		return "", fmt.Errorf("failed to create raw cc_library directory %q: %w", destPath, err)
+ 	}
+-	if _, _, err := utils.ExecCommand(runner, "cp", "-r", libLocationPath, destPath); err != nil {
++	if _, _, err := utils.ExecCommandContext(ctx, runner, "cp", "-r", libLocationPath, destPath); err != nil {
+ 		return "", fmt.Errorf("failed to copy raw cc_library rule from %q to %q: %w", libLocationPath, destPath, err)
+ 	}
+ 	finalDestPath = filepath.Join(destPath, filepath.Base(libLocationPath))
+diff --git a/go/bazel/importcomment.go b/go/bazel/importcomment.go
+index 066f560..58bf9cb 100644
+--- a/go/bazel/importcomment.go
++++ b/go/bazel/importcomment.go
+@@ -1,6 +1,7 @@
+ package bazel
+ 
+ import (
++	"context"
+ 	"fmt"
+ 	"go/ast"
+ 	"go/parser"
+@@ -21,13 +22,16 @@ import (
+ // Solution: explicitly remove the import comment.
+ // Origin Src: package buffer // import "go.uber.org/zap/buffer"
+ // Expect: package buffer
+-func (br *gopathWrapper) fixImportComment(runner utils.Runner, gopathRoot string) error {
++func (br *gopathWrapper) fixImportComment(ctx context.Context, runner utils.Runner, gopathRoot string) error {
++	if err := ctx.Err(); err != nil {
++		return fmt.Errorf("fix import comment canceled: %w", err)
++	}
+ 	_, patherr := os.Stat(gopathRoot)
+ 	if os.IsNotExist(patherr) {
+ 		return nil
+ 	}
+ 	// By default, the folder is read-only, relax it in order to rename it.
+-	if _, _, err := utils.ExecCommand(runner, "chmod", "-R", "777", gopathRoot); err != nil {
++	if _, _, err := utils.ExecCommandContext(ctx, runner, "chmod", "-R", "777", gopathRoot); err != nil {
+ 		return err
+ 	}
+ 
+diff --git a/go/bazel/inferfaces.go b/go/bazel/inferfaces.go
+index 90dc3ef..374b45e 100644
+--- a/go/bazel/inferfaces.go
++++ b/go/bazel/inferfaces.go
+@@ -1,6 +1,8 @@
+ package bazel
+ 
+ import (
++	"context"
++
+ 	"github.com/uber-research/rpcshield/go/common/utils"
+ )
+ 
+@@ -9,6 +11,18 @@ type GoPathWrapper interface {
+ 	LiftGoPath(runner utils.Runner, target string) (string, []string, error)
+ }
+ 
++// ContextGoPathWrapper is the optional, context-aware extension of
++// GoPathWrapper. Implementations that support cancellation (the real
++// *gopathWrapper does) kill long-running sub-commands -- notably the
++// `bazel build` at the heart of GOPATH lifting -- when ctx is canceled and
++// return the context error. Callers (the driver) use a type assertion to
++// opt in; implementations that only satisfy GoPathWrapper keep working
++// unchanged (the driver checks ctx.Err() around them instead).
++type ContextGoPathWrapper interface {
++	GoPathWrapper
++	LiftGoPathContext(ctx context.Context, runner utils.Runner, target string) (string, []string, error)
++}
++
+ // FSRenamer interface to abstract the Rename method.
+ type FSRenamer interface {
+ 	Rename(gopath, path string) error
+diff --git a/go/bazel/serverlessfix.go b/go/bazel/serverlessfix.go
+index 939126c..1f19329 100644
+--- a/go/bazel/serverlessfix.go
++++ b/go/bazel/serverlessfix.go
+@@ -1,6 +1,7 @@
+ package bazel
+ 
+ import (
++	"context"
+ 	"fmt"
+ 	"os"
+ 	"path/filepath"
+@@ -18,7 +19,7 @@ var (
+ // processServerlessFix fix the no main pkg issue for serverless targets
+ // The general flow is to 1) build the target to generate main.go
+ // and 2) copy the main.go to the synthesized analysis directory
+-func (br *gopathWrapper) processServerlessFix(runner utils.Runner, target, bazelBinPath, pkgPath, gopathRoot, gopathPkgAndPath string) error {
++func (br *gopathWrapper) processServerlessFix(ctx context.Context, runner utils.Runner, target, bazelBinPath, pkgPath, gopathRoot, gopathPkgAndPath string) error {
+ 	targetServiceName := strings.Split(target, ":")[1]
+ 	// check if the target is a serverless targe
+ 	if !strings.HasPrefix(targetServiceName, "serverless-") {
+@@ -29,7 +30,7 @@ func (br *gopathWrapper) processServerlessFix(runner utils.Runner, target, bazel
+ 	destPath := filepath.Join(gopathRoot, pkgPath)
+ 	// build the target to generate main.go
+ 	// TODO: find ways to only run the main.go generation logic via bazel and avoid building the entire target
+-	_, _, err := utils.ExecCommand(runner, br.BazelPath, append(slices.Clone(_buildCmd), target)...)
++	_, _, err := utils.ExecCommandContext(ctx, runner, br.BazelPath, append(slices.Clone(_buildCmd), target)...)
+ 	if err != nil {
+ 		return err
+ 	}
+@@ -47,7 +48,7 @@ func (br *gopathWrapper) processServerlessFix(runner utils.Runner, target, bazel
+ 	}
+ 
+ 	// copy main.go to path .../../../service-anal/src/../targetServiceName/
+-	if _, _, err := utils.ExecCommand(runner, "cp", "-r", mainFile, destMainPath); err != nil {
++	if _, _, err := utils.ExecCommandContext(ctx, runner, "cp", "-r", mainFile, destMainPath); err != nil {
+ 		return fmt.Errorf("failed to copy generated main from %q to %q: %w", generatedMainPath, destPath, err)
+ 	}
+ 
+diff --git a/go/cancel_test.go b/go/cancel_test.go
+new file mode 100644
+index 0000000..d91cdd7
+--- /dev/null
++++ b/go/cancel_test.go
+@@ -0,0 +1,262 @@
++package rpcshield
++
++import (
++	"context"
++	"errors"
++	"go/ast"
++	"go/parser"
++	"go/token"
++	"go/types"
++	"os"
++	"path/filepath"
++	"testing"
++	"time"
++
++	"github.com/sashabaranov/go-openai"
++	"github.com/stretchr/testify/require"
++	"github.com/uber-research/rpcshield/go/common/pkgdeps"
++	"github.com/uber-research/rpcshield/go/constant"
++	"github.com/uber-research/rpcshield/go/finder/servicemapping"
++	"github.com/uber-research/rpcshield/go/genai"
++	"github.com/uber-research/rpcshield/go/grail"
++	"github.com/uber-research/rpcshield/go/staticanalyzer/asthelper"
++	genaimock "mock/github.com/uber-research/rpcshield/go/genai/genaimock"
++	"go.uber.org/mock/gomock"
++	"go.uber.org/zap"
++	"golang.org/x/tools/go/packages"
++	"golang.org/x/tools/go/ssa"
++)
++
++const cancelTestService = "cancel-svc"
++
++func newCancelTestDriver(t *testing.T, aiClient genai.Client, opts DriverOptions) *Driver {
++	t.Helper()
++	serviceMapper := servicemapping.New([]grail.Service{{Name: cancelTestService, Tier: 2}}, nil, zap.NewNop().Sugar())
++	return NewDriver("", nil, nil, serviceMapper, aiClient,
++		[]grail.Service{{Name: cancelTestService, Tier: 2}}, nil, zap.NewNop().Sugar(), opts)
++}
++
++// sentinelArtifacts writes "trusted" result.json/CSV/HTML content for the
++// service into dir. A canceled run must leave them byte-for-byte untouched.
++func sentinelArtifacts(t *testing.T, dir string) []string {
++	t.Helper()
++	names := []string{
++		cancelTestService + "_result.json",
++		cancelTestService + ".csv",
++		cancelTestService + ".html",
++	}
++	var paths []string
++	for i, name := range names {
++		p := filepath.Join(dir, name)
++		require.NoError(t, os.WriteFile(p, []byte("trusted complete artifact "+string(rune('1'+i))), 0644))
++		paths = append(paths, p)
++	}
++	return paths
++}
++
++func assertArtifactsUntouched(t *testing.T, paths []string) {
++	t.Helper()
++	for i, p := range paths {
++		got, err := os.ReadFile(p)
++		require.NoError(t, err, "trusted artifact must still exist: %s", p)
++		require.Equal(t, "trusted complete artifact "+string(rune('1'+i)), string(got),
++			"trusted artifact was overwritten: %s", p)
++	}
++}
++
++func assertNoTempArtifacts(t *testing.T, dir string) {
++	t.Helper()
++	left, err := filepath.Glob(filepath.Join(dir, ".*.tmp-*"))
++	require.NoError(t, err)
++	require.Empty(t, left, "temporary artifacts left behind: %v", left)
++}
++
++// TestRun_PreCanceledRejectsAllTargets: with the context already canceled,
++// Run must not accept any target at all (PackageSource never invoked), must
++// return the recognizable ErrCanceled wrapping context.Canceled, and must
++// preserve the previously generated trusted artifacts.
++func TestRun_PreCanceledRejectsAllTargets(t *testing.T) {
++	t.Parallel()
++	dir := t.TempDir()
++	sentinels := sentinelArtifacts(t, dir)
++
++	packageSourceCalled := false
++	d := newCancelTestDriver(t, nil, DriverOptions{
++		OutputDir: dir,
++		Targets:   []string{"//src/some/target:binary", "//src/other/target:binary2"},
++		PackageSource: func(string) ([]*packages.Package, []*ssa.Package, *ssa.Program, error) {
++			packageSourceCalled = true
++			t.Error("PackageSource must not be called after cancellation")
++			return nil, nil, nil, nil
++		},
++	})
++
++	ctx, cancel := context.WithCancel(context.Background())
++	cancel()
++
++	result, err := d.Run(ctx, cancelTestService)
++	require.Error(t, err)
++	require.True(t, errors.Is(err, ErrCanceled), "expected ErrCanceled, got %v", err)
++	require.True(t, errors.Is(err, context.Canceled), "expected wrapped context.Canceled, got %v", err)
++	require.Equal(t, Error, result.Status, "a canceled run must never be reported as success")
++	require.NotEmpty(t, result.ErrorMsg)
++	require.False(t, packageSourceCalled)
++
++	assertArtifactsUntouched(t, sentinels)
++	assertNoTempArtifacts(t, dir)
++}
++
++// TestRun_CanceledDuringTargetLoading deterministically cancels while target
++// loading is in flight: the PackageSource blocks on a gate until ctx is
++// canceled. Run must wait for the loading call to return and then surface
++// ErrCanceled -- proving in-flight stages converge and no further targets run.
++func TestRun_CanceledDuringTargetLoading(t *testing.T) {
++	t.Parallel()
++	dir := t.TempDir()
++	sentinels := sentinelArtifacts(t, dir)
++
++	ctx, cancel := context.WithCancel(context.Background())
++	defer cancel()
++
++	entered := make(chan struct{})
++	d := newCancelTestDriver(t, nil, DriverOptions{
++		OutputDir: dir,
++		Targets:   []string{"//src/some/target:binary"},
++		PackageSource: func(string) ([]*packages.Package, []*ssa.Package, *ssa.Program, error) {
++			close(entered)
++			<-ctx.Done() // simulate a long target load; return only once canceled
++			return nil, nil, nil, ctx.Err()
++		},
++	})
++
++	runDone := make(chan struct{})
++	var result Result
++	var err error
++	go func() {
++		result, err = d.Run(ctx, cancelTestService)
++		close(runDone)
++	}()
++
++	select {
++	case <-entered:
++	case <-time.After(5 * time.Second):
++		t.Fatal("target loading never started")
++	}
++	cancel()
++
++	select {
++	case <-runDone:
++	case <-time.After(5 * time.Second):
++		t.Fatal("Run did not converge after canceling an in-flight target load")
++	}
++	require.Error(t, err)
++	require.True(t, errors.Is(err, ErrCanceled))
++	require.True(t, errors.Is(err, context.Canceled))
++	require.Equal(t, Error, result.Status)
++
++	assertArtifactsUntouched(t, sentinels)
++	assertNoTempArtifacts(t, dir)
++}
++
++// TestRunLLMAnalyzer_CanceledMidRequest proves the "LLM request in flight"
++// cancellation scenario at the driver/genai seam: the chat completion call
++// blocks until the caller cancels ctx, then returns the context error --
++// exactly what the openai HTTP client does when its request is aborted.
++// runLLMAnalyzer must propagate an error satisfying errors.Is(context.Canceled),
++// which analyzeEdge/analyzeCallPaths use to abort the whole run instead of
++// recording a FailUnknownWithError edge diagnostic.
++func TestRunLLMAnalyzer_CanceledMidRequest(t *testing.T) {
++	t.Parallel()
++
++	// Write a tiny caller source file so genai's func-source dump succeeds.
++	dir := t.TempDir()
++	srcPath := filepath.Join(dir, "f.go")
++	src := "package x\n\nfunc F() {}\n"
++	require.NoError(t, os.WriteFile(srcPath, []byte(src), 0644))
++
++	ctrl := gomock.NewController(t)
++	aiClient := genaimock.NewMockClient(ctrl)
++	inFlight := make(chan struct{})
++	aiClient.EXPECT().CreateChatCompletion(gomock.Any(), gomock.Any()).
++		DoAndReturn(func(ctx context.Context, _ openai.ChatCompletionRequest) (openai.ChatCompletionResponse, error) {
++			close(inFlight)
++			<-ctx.Done() // request in flight until canceled, as the HTTP client does
++			return openai.ChatCompletionResponse{}, ctx.Err()
++		})
++
++	d := newCancelTestDriver(t, aiClient, DriverOptions{
++		Analyzers: map[constant.AnalyzerKind]bool{constant.LLM: true},
++	})
++
++	fset := token.NewFileSet()
++	f, err := parser.ParseFile(fset, srcPath, src, parser.ParseComments)
++	require.NoError(t, err)
++	caller := f.Decls[0].(*ast.FuncDecl)
++	callee := &ast.CallExpr{Fun: &ast.Ident{Name: "g"}}
++	astCtx := &asthelper.ASTContext{
++		PkgInfo: &pkgdeps.Info{Pkg: &packages.Package{Fset: fset}},
++	}
++	calleeObj := types.NewFunc(token.NoPos, nil, "g", nil)
++
++	ctx, cancel := context.WithCancel(context.Background())
++	defer cancel()
++
++	out := make(chan error, 1)
++	go func() {
++		_, e := d.runLLMAnalyzer(ctx, caller, callee, calleeObj, astCtx)
++		out <- e
++	}()
++
++	select {
++	case <-inFlight:
++	case <-time.After(5 * time.Second):
++		t.Fatal("LLM request never became in flight")
++	}
++	cancel()
++
++	select {
++	case err := <-out:
++		require.Error(t, err)
++		require.True(t, errors.Is(err, context.Canceled),
++			"in-flight LLM cancellation must propagate as context.Canceled, got %v", err)
++	case <-time.After(5 * time.Second):
++		t.Fatal("runLLMAnalyzer did not return after canceling the in-flight request")
++	}
++}
++
++// TestScheduleGoPathCleanup_KeepGoPathAfterRun verifies the preserved-tree
++// policy: with KeepGoPathAfterRun the lifted directory must survive cleanup.
++func TestScheduleGoPathCleanup_KeepGoPathAfterRun(t *testing.T) {
++	t.Parallel()
++	dir := t.TempDir()
++	marker := filepath.Join(dir, "lifted")
++	require.NoError(t, os.WriteFile(marker, []byte("gopath"), 0644))
++
++	d := newCancelTestDriver(t, nil, DriverOptions{KeepGoPathAfterRun: true})
++	d.scheduleGoPathCleanup(dir)
++
++	_, err := os.Stat(marker)
++	require.NoError(t, err, "KeepGoPathAfterRun must preserve the lifted GOPATH tree")
++}
++
++// TestRemoveGoPathDetached verifies the actual reclamation primitive (used
++// for every non-test, non-keep run, including runs aborted by cancellation):
++// the detached rm removes the lifted tree shortly after the run exits.
++func TestRemoveGoPathDetached(t *testing.T) {
++	t.Parallel()
++	dir := t.TempDir()
++	require.NoError(t, os.WriteFile(filepath.Join(dir, "a"), []byte("a"), 0644))
++	require.NoError(t, os.MkdirAll(filepath.Join(dir, "sub"), 0755))
++	require.NoError(t, os.WriteFile(filepath.Join(dir, "sub", "b"), []byte("b"), 0644))
++
++	require.NoError(t, removeGoPathDetached(dir))
++
++	deadline := time.Now().Add(5 * time.Second)
++	for time.Now().Before(deadline) {
++		if _, err := os.Stat(dir); os.IsNotExist(err) {
++			return
++		}
++		time.Sleep(20 * time.Millisecond)
++	}
++	t.Fatalf("lifted GOPATH %s was not reclaimed", dir)
++}
+diff --git a/go/cmd/rpcshield/BUILD.bazel b/go/cmd/rpcshield/BUILD.bazel
+index f05bbc8..03ff190 100644
+--- a/go/cmd/rpcshield/BUILD.bazel
++++ b/go/cmd/rpcshield/BUILD.bazel
+@@ -1,8 +1,8 @@
+-load("@io_bazel_rules_go//go:def.bzl", "go_binary", "go_library")
++load("@io_bazel_rules_go//go:def.bzl", "go_binary", "go_library", "go_test")
+ 
+ go_library(
+     name = "rpcshield_lib",
+-    srcs = ["main.go"],
++    srcs = ["main.go", "signals.go"],
+     importpath = "github.com/uber-research/rpcshield/go/cmd/rpcshield",
+     visibility = ["//visibility:private"],
+     deps = [
+@@ -20,3 +20,12 @@ go_binary(
+     embed = [":rpcshield_lib"],
+     visibility = ["//visibility:public"],
+ )
++
++go_test(
++    name = "rpcshield_test",
++    srcs = ["signals_test.go"],
++    embed = [":rpcshield_lib"],
++    deps = [
++        "@com_github_stretchr_testify//require:go_default_library",
++    ],
++)
+diff --git a/go/cmd/rpcshield/jsonmode/jsonmode.go b/go/cmd/rpcshield/jsonmode/jsonmode.go
+index 0b85b72..5b9da06 100644
+--- a/go/cmd/rpcshield/jsonmode/jsonmode.go
++++ b/go/cmd/rpcshield/jsonmode/jsonmode.go
+@@ -42,9 +42,12 @@ type Options struct {
+ 	HTMLReport bool
+ }
+ 
+-// Run runs the JSON mode of rpcshield.
+-func Run(opts *Options, aiclient genai.Client) error {
+-	ctx := context.Background()
++// Run runs the JSON mode of rpcshield. ctx carries SIGINT/SIGTERM/caller
++// cancellation into the (potentially long) LLM call-chain analysis.
++func Run(ctx context.Context, opts *Options, aiclient genai.Client) error {
++	if ctx == nil {
++		ctx = context.Background()
++	}
+ 	logger, err := common.BuildLogger(opts.LogLevel)
+ 	if err != nil {
+ 		return fmt.Errorf("failed to build logger: %w", err)
+diff --git a/go/cmd/rpcshield/main.go b/go/cmd/rpcshield/main.go
+index 44a00bb..e87cf1a 100644
+--- a/go/cmd/rpcshield/main.go
++++ b/go/cmd/rpcshield/main.go
+@@ -5,6 +5,7 @@
+ package main
+ 
+ import (
++	"context"
+ 	"flag"
+ 	"fmt"
+ 	"log"
+@@ -95,10 +96,17 @@ func main() {
+ 		}
+ 
+ 		aiclient := genai.New(*genaiBaseURL, *genaiToken)
+-		if err := jsonmode.Run(opts, aiclient); err != nil {
++		ctx, stop := signalContext(context.Background())
++		defer stop()
++		if err := jsonmode.Run(ctx, opts, aiclient); err != nil {
+ 			log.Fatal(err)
+ 		}
+ 	case "wpa":
++		// SIGINT/SIGTERM cancel this context, which threads through wpamode ->
++		// Driver.Run -> target loading, RTA, call tree, analyzers and LLM.
++		ctx, stop := signalContext(context.Background())
++		defer stop()
++
+ 		wpaFlags := flag.NewFlagSet("wpa", flag.ExitOnError)
+ 		service := wpaFlags.String("service", "", "name of the service to analyze")
+ 		workspace := wpaFlags.String("workspace", os.Getenv("WORKSPACE_ROOT"), "source code location, default is $WORKSPACE_ROOT")
+@@ -202,7 +210,7 @@ func main() {
+ 			TierOverrides:                tierOverrides,
+ 			Analyzers:                    analyzersMap,
+ 		}
+-		if _, err := wpamode.Run(opts); err != nil {
++		if _, err := wpamode.Run(ctx, opts); err != nil {
+ 			log.Fatalf("Error running WPA: %v", err)
+ 		}
+ 	default:
+diff --git a/go/cmd/rpcshield/signals.go b/go/cmd/rpcshield/signals.go
+new file mode 100644
+index 0000000..cdd7ca0
+--- /dev/null
++++ b/go/cmd/rpcshield/signals.go
+@@ -0,0 +1,54 @@
++package main
++
++import (
++	"context"
++	"os"
++	"os/signal"
++	"sync"
++	"syscall"
++)
++
++// signalContext returns a context that is canceled on the first SIGINT or
++// SIGTERM (Ctrl-C in a terminal, or a container orchestrator's stop signal).
++// A second signal restores Go's default handler and re-raises the signal to
++// the process, so an impatient user can still force-kill a run that is taking
++// too long to converge -- while a single press performs the graceful shutdown
++// the rest of the pipeline implements (stop accepting targets/work, wait for
++// in-flight workers and LLM requests, preserve trusted artifacts, clean up
++// the lifted GOPATH).
++//
++// The returned stop function detaches the handler and releases the watcher
++// goroutine; callers should defer it. Like signal.NotifyContext's stop, it
++// also cancels the context, so it must only run after the work has finished.
++func signalContext(parent context.Context) (context.Context, context.CancelFunc) {
++	ctx, cancel := context.WithCancel(parent)
++	sigCh := make(chan os.Signal, 2)
++	signal.Notify(sigCh, os.Interrupt, syscall.SIGTERM)
++	done := make(chan struct{})
++
++	go func() {
++		select {
++		case <-sigCh:
++			// First signal: graceful cancellation.
++			cancel()
++		case <-done:
++			return
++		}
++		select {
++		case sig := <-sigCh:
++			// Second signal: restore default behavior and force-exit.
++			signal.Reset(os.Interrupt, syscall.SIGTERM)
++			if s, ok := sig.(syscall.Signal); ok {
++				_ = syscall.Kill(syscall.Getpid(), s)
++			}
++		case <-done:
++		}
++	}()
++
++	stop := sync.OnceFunc(func() {
++		close(done)
++		signal.Stop(sigCh)
++		cancel()
++	})
++	return ctx, stop
++}
+diff --git a/go/cmd/rpcshield/signals_test.go b/go/cmd/rpcshield/signals_test.go
+new file mode 100644
+index 0000000..4c5a199
+--- /dev/null
++++ b/go/cmd/rpcshield/signals_test.go
+@@ -0,0 +1,46 @@
++package main
++
++import (
++	"context"
++	"errors"
++	"syscall"
++	"testing"
++	"time"
++
++	"github.com/stretchr/testify/require"
++)
++
++// TestSignalContext_CancelsOnSIGINT deterministically reproduces the
++// Ctrl-C path: a SIGINT delivered to the process cancels the context exactly
++// once, and stop() releases the handler without canceling it a second time
++// meaningfully. The force-exit-on-second-signal behavior is intentionally not
++// exercised here (it would kill the test binary).
++func TestSignalContext_CancelsOnSIGINT(t *testing.T) {
++	ctx, stop := signalContext(context.Background())
++	defer stop()
++
++	require.NoError(t, ctx.Err())
++	require.NoError(t, syscall.Kill(syscall.Getpid(), syscall.SIGINT))
++
++	deadline := time.After(5 * time.Second)
++	for ctx.Err() == nil {
++		select {
++		case <-deadline:
++			t.Fatal("context was not canceled by SIGINT")
++		case <-time.After(10 * time.Millisecond):
++		}
++	}
++	require.True(t, errors.Is(ctx.Err(), context.Canceled))
++}
++
++// TestSignalContext_StopDetaches verifies a run that finishes without any
++// signal simply completes and stop detaches the handler (subsequent signals
++// no longer touch the context).
++func TestSignalContext_StopDetaches(t *testing.T) {
++	ctx, stop := signalContext(context.Background())
++	stop()
++	// stop cancels the internal context (mirrors signal.NotifyContext's stop
++	// semantics) and must be idempotent.
++	require.ErrorIs(t, ctx.Err(), context.Canceled)
++	stop()
++}
+diff --git a/go/cmd/rpcshield/wpamode/wpa.go b/go/cmd/rpcshield/wpamode/wpa.go
+index a89e8c4..166b670 100644
+--- a/go/cmd/rpcshield/wpamode/wpa.go
++++ b/go/cmd/rpcshield/wpamode/wpa.go
+@@ -177,7 +177,16 @@ type Options struct {
+ const _numRenameWorkers = 16
+ 
+ // Run is the entrypoint for running whole program analysis mode of rpcshield.
+-func Run(options Options) (rpcshield.Result, error) {
++// The supplied ctx carries SIGINT/SIGTERM cancellation (from the CLI) or a
++// caller cancellation (from library integrations) into the driver: a
++// canceled run stops accepting new targets and work units, waits for workers
++// already started to converge, preserves prior complete artifacts, cleans up
++// lifted GOPATH trees, and returns an error wrapping context.Canceled (also
++// discoverable via rpcshield.ErrCanceled).
++func Run(ctx context.Context, options Options) (rpcshield.Result, error) {
++	if ctx == nil {
++		ctx = context.Background()
++	}
+ 	if options.CPUProfile != "" {
+ 		f, err := os.Create(options.CPUProfile)
+ 		if err != nil {
+@@ -244,9 +253,6 @@ func Run(options Options) (rpcshield.Result, error) {
+ 	redacted.GenAIAPIUSSOToken = "<REDACTED>"
+ 	logger.Infow("Running WPA", "options", redacted)
+ 
+-	ctx, cancel := context.WithCancel(context.Background())
+-	defer cancel()
+-
+ 	runner := utils.OSRunner{}
+ 	renamer := bazel.NewFSRenamer(utils.OSFileSystem{}, _numRenameWorkers, logger)
+ 	cfg := config.Config{
+@@ -405,7 +411,13 @@ func Run(options Options) (rpcshield.Result, error) {
+ 	if options.ReportMetrics && options.ReportResult == nil {
+ 		logger.Warnw("ReportMetrics is set but no ReportResult configured, skipping reporting")
+ 	}
+-	if options.ReportMetrics && options.ReportResult != nil {
++	if options.ReportMetrics && errors.Is(err, rpcshield.ErrCanceled) {
++		// A canceled run is an aborted partial computation: skip external
++		// LDA reporting side effects so no metrics are emitted for a prefix
++		// of the analysis.
++		logger.Warnw("Skipping LDA metrics reporting: run was canceled", "service", options.Service)
++	}
++	if options.ReportMetrics && options.ReportResult != nil && !errors.Is(err, rpcshield.ErrCanceled) {
+ 		logger.Infow("reporting result via LDA", "service", options.Service)
+ 		// Add additional meta metrics of the run to the result metrics.
+ 		values := map[string]string{
+diff --git a/go/common/utils/utils.go b/go/common/utils/utils.go
+index 4d5b570..24c37f5 100644
+--- a/go/common/utils/utils.go
++++ b/go/common/utils/utils.go
+@@ -2,6 +2,7 @@ package utils
+ 
+ import (
+ 	"bytes"
++	"context"
+ 	"errors"
+ 	"fmt"
+ 	"go/token"
+@@ -218,6 +219,25 @@ func ExecCommand(runner Runner, name string, arg ...string) (string, string, err
+ 	return stdout.String(), stderr.String(), nil
+ }
+ 
++// ExecCommandContext is ExecCommand with a cancellation context: when ctx is
++// canceled while the command is still running, os/exec kills the process
++// group member (exec.CommandContext default Cancel) and runner.Run returns a
++// context error, which is wrapped in the same shape as ExecCommand's errors.
++// Long-running target-loading commands (notably `bazel build`) therefore stop
++// consuming CPU promptly on SIGINT/SIGTERM or caller cancellation instead of
++// running to completion in the background.
++func ExecCommandContext(ctx context.Context, runner Runner, name string, arg ...string) (string, string, error) {
++	cmd := exec.CommandContext(ctx, name, arg...)
++	var stdout, stderr bytes.Buffer
++	cmd.Stdout = &stdout
++	cmd.Stderr = &stderr
++	err := runner.Run(cmd)
++	if err != nil {
++		return "", "", fmt.Errorf("failed to execute command %q %v: %w\nSTDOUT: %s\nSTDERR: %s", name, arg, err, stdout.String(), stderr.String())
++	}
++	return stdout.String(), stderr.String(), nil
++}
++
+ // GetMaxUsedDram returns the maximum used DRAM (Resident Set Size) in bytes.
+ func GetMaxUsedDram() int64 {
+ 	var rusage syscall.Rusage
+diff --git a/go/driver.go b/go/driver.go
+index f9702ed..3810d80 100644
+--- a/go/driver.go
++++ b/go/driver.go
+@@ -231,6 +231,33 @@ const (
+ 	Error Status = "error"
+ )
+ 
++// ErrCanceled is the recognizable cancellation error returned by Driver.Run
++// (and the stages it drives) when the run is aborted by a canceled context --
++// SIGINT/SIGTERM at the CLI or a caller-canceled context. It wraps the
++// underlying context error (context.Canceled / context.DeadlineExceeded), so
++// callers can identify cancellation either via errors.Is(err, ErrCanceled) or
++// errors.Is(err, context.Canceled), and distinguish it from the ordinary
++// analysis/load diagnostics that keep being returned for every other failure.
++var ErrCanceled = errors.New("rpcshield: analysis canceled")
++
++// canceledErr wraps ErrCanceled together with the underlying context error.
++// Returns nil when ctx is not done.
++func canceledErr(ctx context.Context) error {
++	if ctx == nil {
++		return nil
++	}
++	if err := ctx.Err(); err != nil {
++		return fmt.Errorf("%w: %w", ErrCanceled, err)
++	}
++	return nil
++}
++
++// isContextError reports whether err is a context cancellation/timeout error
++// (as opposed to an analyzer/load diagnostic).
++func isContextError(err error) bool {
++	return errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded)
++}
++
+ // Result contains the result of the rpcshield run.
+ type Result struct {
+ 	// Status indicates the overall status of the rpcshield run.
+@@ -304,10 +331,20 @@ var _missingSVG string
+ // Run is the entrypoint of the driver. It never panics (if it does, it will be caught and returned
+ // as an error).
+ func (d *Driver) Run(ctx context.Context, serviceName string) (result Result, err error) {
++	if ctx == nil {
++		ctx = context.Background()
++	}
+ 	defer func() {
+ 		if r := recover(); r != nil {
+ 			err = errors.Join(err, fmt.Errorf("panic: %v, stacktrace:\n%v", r, string(debug.Stack())))
+ 		}
++		// If a stage silently returned nil on a canceled context, surface the
++		// recognizable cancellation error instead of treating it as success.
++		if err == nil {
++			if cErr := canceledErr(ctx); cErr != nil {
++				err = cErr
++			}
++		}
+ 		// Overwrite the result status if there was an error.
+ 		if err != nil {
+ 			result.Status = Error
+@@ -316,13 +353,33 @@ func (d *Driver) Run(ctx context.Context, serviceName string) (result Result, er
+ 			// the in-memory copy after the file has already been written.
+ 			result.ErrorMsg = err.Error()
+ 		}
++		// A canceled run must NOT overwrite a previous run's complete
++		// result.json with partial content: a prefix of a multi-target
++		// analysis is not a trusted artifact. Skip persistence entirely.
++		if errors.Is(err, ErrCanceled) {
++			d.Logger.Warnw("Skipping result.json write: run was canceled", "service", serviceName)
++			return
++		}
+ 		// Write result to the output directory for debugging purposes.
+-		f, fOpenError := os.Create(filepath.Join(d.opts.OutputDir, fmt.Sprintf("%s_result.json", serviceName)))
++		// Encode to a temp file in the same directory and atomically rename
++		// it into place, so an interrupted/failed encode cannot truncate an
++		// already-present complete result.json.
++		resultPath := filepath.Join(d.opts.OutputDir, fmt.Sprintf("%s_result.json", serviceName))
++		f, fOpenError := os.CreateTemp(d.opts.OutputDir, fmt.Sprintf(".%s_result.json.tmp-*", serviceName))
+ 		if fOpenError != nil {
+-			err = errors.Join(err, fmt.Errorf("create result file: %w", fOpenError))
++			err = errors.Join(err, fmt.Errorf("create result temp file: %w", fOpenError))
++		} else {
++			tmpPath := f.Name()
++			encErr := json.NewEncoder(f).Encode(result)
++			closeErr := f.Close()
++			if encErr != nil || closeErr != nil {
++				os.Remove(tmpPath)
++				err = errors.Join(err, fmt.Errorf("encode result: %w", encErr), fmt.Errorf("close result temp file: %w", closeErr))
++			} else if renameErr := os.Rename(tmpPath, resultPath); renameErr != nil {
++				os.Remove(tmpPath)
++				err = errors.Join(err, fmt.Errorf("finalize result file: %w", renameErr))
++			}
+ 		}
+-		err = errors.Join(err, json.NewEncoder(f).Encode(result))
+-		err = errors.Join(err, f.Close())
+ 		if err != nil {
+ 			result.ErrorMsg = err.Error()
+ 		}
+@@ -355,10 +412,16 @@ func (d *Driver) Run(ctx context.Context, serviceName string) (result Result, er
+ 	}
+ 
+ 	start := time.Now()
++	if err := canceledErr(ctx); err != nil {
++		return result, err
++	}
+ 	targets, err := d.findTargets(serviceName)
+ 	if err != nil {
+ 		return result, fmt.Errorf("find targets: %w", err)
+ 	}
++	if err := canceledErr(ctx); err != nil {
++		return result, err
++	}
+ 	result.RunMetrics[_targetCount] = float64(len(targets))
+ 	result.RunMetrics[_findTargetDurationSecs] = time.Now().Sub(start).Seconds()
+ 
+@@ -431,6 +494,12 @@ func (d *Driver) Run(ctx context.Context, serviceName string) (result Result, er
+ 	start = time.Now()
+ 	pathCache := make(map[string]bool)
+ 	for tidx, target := range targets {
++		// Stop accepting new targets after cancellation. Targets already in
++		// flight are handled by the per-stage checks below; a prefix of a
++		// multi-target analysis must never be reported as a success.
++		if err := canceledErr(ctx); err != nil {
++			return result, err
++		}
+ 		// Service configs occasionally list bare-workspace target labels (pkg/path:name)
+ 		// without the //-prefix. Bazel interprets bare labels relative to the process cwd,
+ 		// which for rpcshield is generally not the workspace root -- so any downstream
+@@ -449,8 +518,14 @@ func (d *Driver) Run(ctx context.Context, serviceName string) (result Result, er
+ 			var err error
+ 			pkgs, ssaPkgs, ssaProg, err = d.opts.PackageSource(target)
+ 			if err != nil {
++				if isContextError(err) {
++					return result, canceledErr(ctx)
++				}
+ 				return result, fmt.Errorf("load packages from PackageSource: %w", err)
+ 			}
++			if err := canceledErr(ctx); err != nil {
++				return result, err
++			}
+ 			d.Logger.Infow("Loaded packages via PackageSource", "num_packages", len(pkgs))
+ 			result.RunMetrics[_pkgCount] += float64(len(pkgs))
+ 		} else if d.opts.BazelLoader != nil && useBazelLoader(serviceName, d.opts.Config.BazelLoaderServices) {
+@@ -464,8 +539,14 @@ func (d *Driver) Run(ctx context.Context, serviceName string) (result Result, er
+ 				pkgs = append(pkgs, pkg)
+ 			})
+ 			if err != nil {
++				if isContextError(err) {
++					return result, canceledErr(ctx)
++				}
+ 				return result, fmt.Errorf("load all packages under %q: %w", targetPkgPath, err)
+ 			}
++			if err := canceledErr(ctx); err != nil {
++				return result, err
++			}
+ 			d.Logger.Infow("Loaded packages", "num_packages", len(pkgs))
+ 			d.Logger.Debugw("Packages", "packages", pkgs)
+ 			result.RunMetrics[_pkgCount] += float64(len(pkgs))
+@@ -475,35 +556,30 @@ func (d *Driver) Run(ctx context.Context, serviceName string) (result Result, er
+ 			ssaPkgs = ssaProg.AllPackages()
+ 			ssaProg.Build()
+ 		} else {
+-			goPath, cdeps, err := d.GoPathWrapper.LiftGoPath(d.Runner, target)
+-			if err != nil {
+-				return result, fmt.Errorf("lift GOPATH: %w", err)
++			goPath, cdeps, liftErr := d.liftGoPath(ctx, target)
++			// Schedule GOPATH cleanup whether lifting succeeded, failed, or
++			// was canceled: a canceled `bazel build` can leave a partial tree
++			// on disk that must still be reclaimed when the run exits.
++			if goPath != "" {
++				defer d.scheduleGoPathCleanup(goPath)
++			}
++			if liftErr != nil {
++				if isContextError(liftErr) {
++					return result, canceledErr(ctx)
++				}
++				return result, fmt.Errorf("lift GOPATH: %w", liftErr)
+ 			}
+ 			d.Logger.Infow("Lifted GOPATH", "path", goPath, "cdeps", cdeps)
+ 			result.RunMetrics[_liftGoPathDurationSecs] += time.Now().Sub(start).Seconds()
+-			defer func() {
+-				if testing.Testing() {
+-					d.Logger.Infow("Testing mode, not cleaning up GOPATH", "path", goPath)
+-					return
+-				}
+-				if d.opts.KeepGoPathAfterRun {
+-					d.Logger.Infow("KeepGoPathAfterRun set, not cleaning up GOPATH", "path", goPath)
+-					return
+-				}
+-				d.Logger.Infow("Starting a detached process to remove GOPATH to save space", "path", goPath)
+-				cmd := exec.Command("rm", "-rf", goPath)
+-				cmd.SysProcAttr = &syscall.SysProcAttr{Setsid: true} // Start a new session to detach the process.
+-				if err := cmd.Start(); err != nil {
+-					d.Logger.Errorw("Failed to start the process", "error", err)
+-				}
+-				d.Logger.Infow("Started detached process", "pid", cmd.Process.Pid)
+-			}()
+ 
+ 			// Load everything under the GOPATH.
+ 			pkgs, err = loader.LoadAll(goPath, cdeps)
+ 			if err != nil {
+ 				return result, fmt.Errorf("load all packages under %q: %w", goPath, err)
+ 			}
++			if err := canceledErr(ctx); err != nil {
++				return result, err
++			}
+ 			d.Logger.Infow("Loaded packages", "num_packages", len(pkgs))
+ 			d.Logger.Debugw("Packages", "packages", pkgs)
+ 			result.RunMetrics[_pkgCount] += float64(len(pkgs))
+@@ -517,6 +593,9 @@ func (d *Driver) Run(ctx context.Context, serviceName string) (result Result, er
+ 			// Also needed for call graph construction.
+ 			ssaProg.Build()
+ 		}
++		if err := canceledErr(ctx); err != nil {
++			return result, err
++		}
+ 		result.RunMetrics[_pkgLoadingDurationSecs] += time.Now().Sub(start).Seconds()
+ 
+ 		// Dump diagnostics.
+@@ -574,7 +653,10 @@ func (d *Driver) Run(ctx context.Context, serviceName string) (result Result, er
+ 
+ 		// Early exit for CG construction-only eval bench
+ 		if d.opts.CGConstructionOnly {
+-			if err := d.runCGConstructionOnly(pkgs, ssaProg, ssaPkgs, isGlue, entryPkg, inbounds, serviceName, &result); err != nil {
++			if err := d.runCGConstructionOnly(ctx, pkgs, ssaProg, ssaPkgs, isGlue, entryPkg, inbounds, serviceName, &result); err != nil {
++				if isContextError(err) {
++					return result, canceledErr(ctx)
++				}
+ 				return result, err
+ 			}
+ 
+@@ -589,6 +671,9 @@ func (d *Driver) Run(ctx context.Context, serviceName string) (result Result, er
+ 		if err != nil {
+ 			return result, fmt.Errorf("find outbound: %w", err)
+ 		}
++		if err := canceledErr(ctx); err != nil {
++			return result, err
++		}
+ 
+ 		for k, v := range outboundMissingServiceCount {
+ 			result.RunMetrics[_outboundMissingServiceCountPrefix+string(k)] += float64(v)
+@@ -669,6 +754,7 @@ func (d *Driver) Run(ctx context.Context, serviceName string) (result Result, er
+ 			PermutationThreshold:    d.opts.PermutationThreshold,
+ 			CodebasePkgPrefix:       d.opts.Config.CodebasePkgPrefix,
+ 			SafeGoPkgPath:           d.opts.Config.SafeGoPkgPath,
++			Context:                 ctx,
+ 		}
+ 		if d.opts.Config.ExcludePackagePatterns != nil || len(d.opts.Config.ExtraExcludePackagePatterns) > 0 {
+ 			base := graph.DefaultExcludePackagePatterns
+@@ -696,6 +782,9 @@ func (d *Driver) Run(ctx context.Context, serviceName string) (result Result, er
+ 		}
+ 		if err != nil {
+ 			d.Logger.Errorf("Error in builder: %v", err)
++			if isContextError(err) {
++				return result, canceledErr(ctx)
++			}
+ 			return result, err
+ 		}
+ 
+@@ -755,7 +844,14 @@ func (d *Driver) Run(ctx context.Context, serviceName string) (result Result, er
+ 		// Traverse over each call path and run static and LLM analyzers to determine fail-ness status of the path.
+ 		start = time.Now()
+ 		d.Logger.Infow("Analyzing call paths", "analyzers", d.opts.Analyzers, "num_paths", len(paths))
+-		reports = append(reports, d.analyzeCallPaths(pkgs, paths)...)
++		pathReports, analyzeErr := d.analyzeCallPaths(ctx, pkgs, paths)
++		reports = append(reports, pathReports...)
++		if analyzeErr != nil {
++			if isContextError(analyzeErr) {
++				return result, canceledErr(ctx)
++			}
++			return result, analyzeErr
++		}
+ 		// Collect the total counts of each analyzer kind for observability purposes.
+ 		kindStats := make(map[constant.AnalyzerKind]int)
+ 		// Collect the total counts of each fail-ness status across call paths for observability purposes.
+@@ -1113,7 +1209,12 @@ func (d *Driver) enrichReportMetrics(reports []output.Report, explorationPerSour
+ // analyzeCallPaths analyzes the call paths and returns the results of the analysis wrapped in output.Report.
+ // Note that we output reports for each path in the callPaths, aggregating the results by inbound-outbound quadruple
+ // happens in another function.
+-func (d *Driver) analyzeCallPaths(pkgs []*packages.Package, callPaths []*graph.CallPath) []output.Report {
++//
++// Cancellation is checked between paths and between hops. A canceled in-flight
++// LLM request aborts itself through the HTTP client's context. On cancellation
++// the function returns the reports completed so far plus the context error;
++// the driver discards the prefix -- it is never written to any artifact.
++func (d *Driver) analyzeCallPaths(ctx context.Context, pkgs []*packages.Package, callPaths []*graph.CallPath) ([]output.Report, error) {
+ 	allPkgsMap := make(map[string]*packages.Package, len(pkgs))
+ 	for _, p := range pkgs {
+ 		allPkgsMap[p.PkgPath] = p
+@@ -1137,14 +1238,27 @@ func (d *Driver) analyzeCallPaths(pkgs []*packages.Package, callPaths []*graph.C
+ 	// Analyze each path in `callPaths`.
+ 	allResults := make([]output.Report, 0, len(callPaths))
+ 	for _, path := range callPaths {
++		// Check cancellation before starting each new path.
++		if err := ctx.Err(); err != nil {
++			return allResults, err
++		}
+ 		edgeResults := make([]*output.EdgeWrapper, 0, len(path.Edges))
+ 		// Analyze each edge (caller-callee pair) in call path in reverse order, i.e., from outbound to inbound.
+ 		for j := len(path.Edges) - 1; j >= 0; j-- {
++			// Check cancellation before each hop so an in-flight LLM request
++			// is the only work that has to finish (it aborts on ctx itself).
++			if err := ctx.Err(); err != nil {
++				return allResults, err
++			}
+ 			var prevEdgeResult *output.EdgeWrapper
+ 			if len(edgeResults) > 0 {
+ 				prevEdgeResult = edgeResults[len(edgeResults)-1]
+ 			}
+-			edgeResults = append(edgeResults, d.analyzeEdge(path.Edges[j], allPkgsMap, prevEdgeResult))
++			edgeResult, err := d.analyzeEdge(ctx, path.Edges[j], allPkgsMap, prevEdgeResult)
++			if err != nil {
++				return allResults, err
++			}
++			edgeResults = append(edgeResults, edgeResult)
+ 		}
+ 
+ 		status := output.AggregatedStatus(edgeResults)
+@@ -1184,10 +1298,17 @@ func (d *Driver) analyzeCallPaths(pkgs []*packages.Package, callPaths []*graph.C
+ 		d.simplifiedToDetailedInbound[report.Inbound] = path.Inbound
+ 		d.simplifiedToDetailedOutbound[report.Outbound] = path.Outbound
+ 	}
+-	return allResults
++	return allResults, nil
+ }
+ 
+-func (d *Driver) analyzeEdge(edge *edgeinfo.EdgeInfo, allPkgsMap map[string]*packages.Package, prevEdgeResult *output.EdgeWrapper) (edgeResult *output.EdgeWrapper) {
++// analyzeEdge analyzes a single edge (hop) of a call path. Ordinary analyzer
++// failures are attached to edgeResult.Errors as before (non-cancel errors keep
++// their diagnostics), while context cancellation is returned as the error so
++// the whole analysis converges and reports ErrCanceled.
++func (d *Driver) analyzeEdge(ctx context.Context, edge *edgeinfo.EdgeInfo, allPkgsMap map[string]*packages.Package, prevEdgeResult *output.EdgeWrapper) (edgeResult *output.EdgeWrapper, err error) {
++	if ctxErr := ctx.Err(); ctxErr != nil {
++		return nil, ctxErr
++	}
+ 	cgEdge := edge.Edge
+ 	caller := cgEdge.Caller.Func
+ 
+@@ -1297,14 +1418,17 @@ func (d *Driver) analyzeEdge(edge *edgeinfo.EdgeInfo, allPkgsMap map[string]*pac
+ 	//  the fail-ness status of the edges.
+ 
+ 	// Run the Cached analyzer, static analyzers (Predefined, SSA, and AST), and LLM analyzer.
+-	analyzerOutput, err := d.runAnalyzers(caller, callee, calleeObj, cgEdge.Site, astContext, edgeResult.SourceGraphLink)
+-	if err != nil {
+-		edgeResult.Errors = append(edgeResult.Errors, fmt.Sprintf("run analyzers: %s", err))
++	analyzerOutput, runErr := d.runAnalyzers(ctx, caller, callee, calleeObj, cgEdge.Site, astContext, edgeResult.SourceGraphLink)
++	if runErr != nil {
++		if isContextError(runErr) {
++			return nil, runErr
++		}
++		edgeResult.Errors = append(edgeResult.Errors, fmt.Sprintf("run analyzers: %s", runErr))
+ 	}
+ 	if analyzerOutput != nil {
+ 		edgeResult.AnalyzerOutput = *analyzerOutput
+ 	}
+-	return
++	return edgeResult, nil
+ }
+ 
+ func (d *Driver) getLastModifiedTimestamp(runner utils.Runner, caller string, filePath string, repoPath string) (string, error) {
+@@ -1410,7 +1534,13 @@ func (d *Driver) queryTimestamp(runner utils.Runner, caller string, fullyCallerF
+ // 2. Run the Predefined analyzer. If it returns a non-unknown status, return it.
+ // 3. Run the SCCP analyzer. If it returns a non-unknown status, return it.
+ // 4. Fall back to SSA, then AST, then LLM analyzers if SCCP fails or returns unknown.
+-func (d *Driver) runAnalyzers(caller *ssa.Function, callee *ast.CallExpr, calleeObj types.Object, calleeSite ssa.CallInstruction, astContext *asthelper.ASTContext, sgLink string) (analyzerOutput *output.AnalyzerOutput, err error) {
++func (d *Driver) runAnalyzers(ctx context.Context, caller *ssa.Function, callee *ast.CallExpr, calleeObj types.Object, calleeSite ssa.CallInstruction, astContext *asthelper.ASTContext, sgLink string) (analyzerOutput *output.AnalyzerOutput, err error) {
++	// The context reaches the LLM HTTP request -- the only I/O-blocking
++	// analyzer. A canceled in-flight request propagates the context error
++	// instead of becoming a FailUnknownWithError edge diagnostic.
++	if err := ctx.Err(); err != nil {
++		return nil, err
++	}
+ 	source := constant.Unknown
+ 
+ 	// As a last resort, we recover from a panic when running the analyzer, convert the panic to
+@@ -1543,8 +1673,14 @@ func (d *Driver) runAnalyzers(caller *ssa.Function, callee *ast.CallExpr, callee
+ 		if prepErr != nil {
+ 			return nil, fmt.Errorf("prepare AST context for LLM analyzer: %w", prepErr)
+ 		}
+-		analyzerOutput, err = d.runLLMAnalyzer(callerFuncDecl, callee, calleeObj, astContext)
++		analyzerOutput, err = d.runLLMAnalyzer(ctx, callerFuncDecl, callee, calleeObj, astContext)
+ 		if err != nil {
++			// Cancellation (incl. an aborted in-flight LLM HTTP request) is
++			// propagated as-is, not downgraded to a FailUnknownWithError
++			// diagnostic: the whole run is unwinding with ErrCanceled.
++			if isContextError(err) {
++				return nil, err
++			}
+ 			err = errors.Join(err, fmt.Errorf("run LLM analyzer: %w", err))
+ 			if analyzerOutput == nil {
+ 				analyzerOutput = &output.AnalyzerOutput{}
+@@ -1558,7 +1694,10 @@ func (d *Driver) runAnalyzers(caller *ssa.Function, callee *ast.CallExpr, callee
+ 	return
+ }
+ 
+-func (d *Driver) runLLMAnalyzer(caller *ast.FuncDecl, callee *ast.CallExpr, calleeObj types.Object, astContext *asthelper.ASTContext) (*output.AnalyzerOutput, error) {
++func (d *Driver) runLLMAnalyzer(ctx context.Context, caller *ast.FuncDecl, callee *ast.CallExpr, calleeObj types.Object, astContext *asthelper.ASTContext) (*output.AnalyzerOutput, error) {
++	if err := ctx.Err(); err != nil {
++		return nil, err
++	}
+ 	if calleeObj == nil {
+ 		return nil, fmt.Errorf("callee is nil")
+ 	}
+@@ -1568,7 +1707,9 @@ func (d *Driver) runLLMAnalyzer(caller *ast.FuncDecl, callee *ast.CallExpr, call
+ 	filePath := startPos.Filename
+ 	llmCallerFuncInput := input.NewLLMFuncInput(caller.Name.Name, filePath, startPos.Line, endPos.Line)
+ 	llmAnalyzerInput := input.NewLLMAnalyzerInput(llmCallerFuncInput, calleeObj.Name(), calleeSitePosition.Line)
+-	analyzerOutput, err := genai.LLMAnalyzer(context.Background(), d.AIClient, "", llmAnalyzerInput, d.Logger)
++	// The HTTP client honors ctx: SIGINT/SIGTERM or caller cancellation abort
++	// a request already in flight instead of waiting for the model to answer.
++	analyzerOutput, err := genai.LLMAnalyzer(ctx, d.AIClient, "", llmAnalyzerInput, d.Logger)
+ 	if err != nil {
+ 		return nil, fmt.Errorf("run LLM analyzer: %w", err)
+ 	}
+@@ -1648,6 +1789,53 @@ func (d *Driver) findTargets(serviceName string) ([]string, error) {
+ 	return resolver.FindTargets(serviceName)
+ }
+ 
++// liftGoPath lifts the GOPATH for the given target. When the configured
++// GoPathWrapper supports cancellation (bazel.ContextGoPathWrapper -- the real
++// *bazel.gopathWrapper does), an in-flight bazel/buildozer sub-command is
++// killed as soon as ctx is canceled. Wrappers that only satisfy the basic
++// interface keep working; cancellation is observed around their call instead.
++func (d *Driver) liftGoPath(ctx context.Context, target string) (string, []string, error) {
++	if cgp, ok := d.GoPathWrapper.(bazel.ContextGoPathWrapper); ok {
++		return cgp.LiftGoPathContext(ctx, d.Runner, target)
++	}
++	goPath, cdeps, err := d.GoPathWrapper.LiftGoPath(d.Runner, target)
++	if err != nil {
++		return goPath, cdeps, err
++	}
++	return goPath, cdeps, canceledErr(ctx)
++}
++
++// scheduleGoPathCleanup reclaims the disk of a lifted GOPATH tree once the run
++// exits. Cleanup is intentionally detached (`setsid` + `rm -rf`) so the
++// potentially large tree is removed without blocking the process. Existing
++// policy is preserved:
++//   - under `go test` the tree is kept (fixtures reuse it);
++//   - KeepGoPathAfterRun keeps the tree (devpod cache warm/reuse);
++//   - every other run -- including runs aborted by cancellation -- cleans up.
++func (d *Driver) scheduleGoPathCleanup(goPath string) {
++	if testing.Testing() {
++		d.Logger.Infow("Testing mode, not cleaning up GOPATH", "path", goPath)
++		return
++	}
++	if d.opts.KeepGoPathAfterRun {
++		d.Logger.Infow("KeepGoPathAfterRun set, not cleaning up GOPATH", "path", goPath)
++		return
++	}
++	if err := removeGoPathDetached(goPath); err != nil {
++		d.Logger.Errorw("Failed to start the GOPATH removal process", "error", err)
++	}
++}
++
++// removeGoPathDetached starts a detached (`setsid`) `rm -rf` process for the
++// given path and returns immediately once it has started. The detached
++// process outlives the analysis so the potentially huge tree is reclaimed
++// after the run exits without blocking it.
++func removeGoPathDetached(goPath string) error {
++	cmd := exec.Command("rm", "-rf", goPath)
++	cmd.SysProcAttr = &syscall.SysProcAttr{Setsid: true} // Start a new session to detach the process.
++	return cmd.Start()
++}
++
+ // findPackageFromTarget finds the package (hinted by the binary bazel target) as the entry point.
+ func (d *Driver) findPackageFromTarget(target string, pkgs []*packages.Package) (*packages.Package, error) {
+ 	targetPkgPath := strings.Split(strings.TrimPrefix(target, "//src/"), ":")[0]
+diff --git a/go/driver_test.go b/go/driver_test.go
+index 0c27b6a..e56af48 100644
+--- a/go/driver_test.go
++++ b/go/driver_test.go
+@@ -632,7 +632,8 @@ func TestDriver_AnalyzeCallPaths_Corner_Cases(t *testing.T) {
+ 			timestampCache:               make(map[string]string),
+ 			Logger:                       zap.NewNop().Sugar(),
+ 		}
+-		results := d.analyzeCallPaths(pkgs, callPaths)
++		results, analyzeErr := d.analyzeCallPaths(context.Background(), pkgs, callPaths)
++		require.NoError(t, analyzeErr)
+ 		var allErrors []string
+ 		for _, r := range results {
+ 			for _, pr := range r.PathResults {
+@@ -752,12 +753,12 @@ func TestDriver_LLM(t *testing.T) {
+ 		IdentFuncLitMap: nil,
+ 	}
+ 
+-	out, err := d.runLLMAnalyzer(caller, callee, calleeObj, astContext)
++	out, err := d.runLLMAnalyzer(context.Background(), caller, callee, calleeObj, astContext)
+ 	require.NoError(t, err)
+ 	require.Equal(t, constant.FailClose, out.Status)
+ 
+ 	// Test case where the LLM API returns an error.
+-	_, err = d.runLLMAnalyzer(caller, callee, nil, astContext)
++	_, err = d.runLLMAnalyzer(context.Background(), caller, callee, nil, astContext)
+ 	require.Error(t, err)
+ }
+ 
+diff --git a/go/genai/genai.go b/go/genai/genai.go
+index 5c935e6..01320d4 100644
+--- a/go/genai/genai.go
++++ b/go/genai/genai.go
+@@ -167,6 +167,11 @@ func AnalyzeEdge(ctx context.Context, aiClient Client, req *AnalyzeEdgeRequest,
+ 	if err != nil {
+ 		return nil, fmt.Errorf("dump function source: %w", err)
+ 	}
++	// Between edges, bail out promptly on cancellation instead of issuing
++	// more chat completions.
++	if err := ctx.Err(); err != nil {
++		return nil, err
++	}
+ 	longQuestion := promptMessage + question + detailer + funcSource + "\n"
+ 	responseString, err := AskGenAI(ctx, aiClient, longQuestion)
+ 	if err != nil {
+diff --git a/go/graph/BUILD.bazel b/go/graph/BUILD.bazel
+index d0886e8..cb6991e 100644
+--- a/go/graph/BUILD.bazel
++++ b/go/graph/BUILD.bazel
+@@ -56,6 +56,7 @@ go_test(
+         "cct_sampling_test.go",
+         "cct_test.go",
+         "cffenricher_test.go",
++        "cancellation_test.go",
+         "constprop_test.go",
+         "contextual_test.go",
+         "errgroupenricher_test.go",
+diff --git a/go/graph/cancellation_test.go b/go/graph/cancellation_test.go
+new file mode 100644
+index 0000000..c6433d5
+--- /dev/null
++++ b/go/graph/cancellation_test.go
+@@ -0,0 +1,56 @@
++package graph
++
++import (
++	"context"
++	"testing"
++
++	"github.com/stretchr/testify/require"
++)
++
++// TestBuild_CanceledContextReturnsCanceledError verifies the graph builder
++// threads a canceled context through the pipeline and returns an error
++// wrapping context.Canceled (rather than a partial/empty result), does no
++// work after cancellation, and returns promptly (the RTA pool rejects all
++// work units when the context is already canceled).
++//
++// commonSetup uses the rpcshielddemo whole-program fixture (same as TestE2E)
++// and leaves the call-tree in its default parallel mode, so the pre-canceled
++// context exercises the RTA entry guard ahead of the parallel CCT workers.
++func TestBuild_CanceledContextReturnsCanceledError(t *testing.T) {
++	b := commonSetup(t, true).(*builderImpl)
++
++	ctx, cancel := context.WithCancel(context.Background())
++	cancel()
++	b.config.Context = ctx
++
++	paths, buildResult, err := b.Build()
++	require.Error(t, err, "Build on a canceled context must return the cancellation error")
++	require.ErrorIs(t, err, context.Canceled)
++	require.Nil(t, paths)
++	require.Nil(t, buildResult)
++}
++
++// TestBuildCGOnly_CanceledContextReturnsCanceledError covers the benchmark
++// sweep entrypoint, which has its own pre-sweep cancellation guard.
++func TestBuildCGOnly_CanceledContextReturnsCanceledError(t *testing.T) {
++	b := commonSetup(t, true).(*builderImpl)
++	b.config.RTABenchFlavors = []RTAFlavor{FlavorStdlib}
++	b.config.RTABenchNumWorkers = []int{1}
++
++	ctx, cancel := context.WithCancel(context.Background())
++	cancel()
++	b.config.Context = ctx
++
++	_, err := b.BuildCGOnly()
++	require.Error(t, err)
++	require.ErrorIs(t, err, context.Canceled)
++}
++
++// TestBuilderContextDefaultsToBackground ensures a builder with no Context
++// configured behaves exactly as before the cancellation work.
++func TestBuilderContextDefaultsToBackground(t *testing.T) {
++	b := commonSetup(t, true).(*builderImpl)
++	require.NotNil(t, b.context())
++	require.NoError(t, b.context().Err())
++	require.NoError(t, b.checkCancel())
++}
+diff --git a/go/graph/cct.go b/go/graph/cct.go
+index 13a46a1..5e18ada 100644
+--- a/go/graph/cct.go
++++ b/go/graph/cct.go
+@@ -1,6 +1,7 @@
+ package graph
+ 
+ import (
++	"context"
+ 	"errors"
+ 	"fmt"
+ 	"runtime"
+@@ -90,7 +91,12 @@ func (b *builderImpl) buildCallTree(graph *callgraph.Graph) (map[*ssa.Function]*
+ 	resultChan := make(chan workerResult, len(b.inboundsSSA))
+ 
+ 	// Worker function that processes a single source
+-	processSource := func(src inbound) {
++	ctx := b.context()
++	processSource := func(src inbound) error {
++		// Never start exploring a new source after cancellation.
++		if err := ctx.Err(); err != nil {
++			return err
++		}
+ 		if b.isDebugEnabled() {
+ 			b.logger.Debugf("Building call tree for source function %s", src.function.String())
+ 		}
+@@ -105,7 +111,7 @@ func (b *builderImpl) buildCallTree(graph *callgraph.Graph) (map[*ssa.Function]*
+ 			cfg.MaxFunctionVisits = b.config.MaxFunctionVisits
+ 		}
+ 		expState := newExplorationStateWithConfig(cfg)
+-		root, err := b.buildCallTreeNode(src.function, sinkSet, graph, visited, nil, localMetrics, expState)
++		root, err := b.buildCallTreeNode(ctx, src.function, sinkSet, graph, visited, nil, localMetrics, expState)
+ 
+ 		// Collect per-IB exploration data
+ 		exploration := expState.Metrics(sinkCanonicalNames)
+@@ -154,6 +160,12 @@ func (b *builderImpl) buildCallTree(graph *callgraph.Graph) (map[*ssa.Function]*
+ 			resultGraph = nil
+ 		}
+ 
++		// A cancellation during exploration overrides partial sub-errors:
++		// the whole build is being abandoned.
++		if ctxErr := ctx.Err(); ctxErr != nil {
++			return ctxErr
++		}
++
+ 		// Send result (even if there was an error, send partial results and metrics)
+ 		resultChan <- workerResult{
+ 			fn:          src.function,
+@@ -162,13 +174,21 @@ func (b *builderImpl) buildCallTree(graph *callgraph.Graph) (map[*ssa.Function]*
+ 			err:         err,
+ 			exploration: exploration,
+ 		}
++		return nil
+ 	}
+ 
+ 	if b.config.DisableParallelCallTree {
+ 		// Sequential mode: process sources one by one
+ 		b.logger.Info("Using sequential call tree computation")
+ 		for _, source := range b.inboundsSSA {
+-			processSource(source)
++			if err := processSource(source); err != nil {
++				// Cancellation: stop launching new sources; workers below have
++				// nothing to wait for in sequential mode.
++				if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
++					close(resultChan)
++					return nil, fmt.Errorf("graph build canceled: %w", err)
++				}
++			}
+ 		}
+ 		close(resultChan)
+ 	} else {
+@@ -176,15 +196,24 @@ func (b *builderImpl) buildCallTree(graph *callgraph.Graph) (map[*ssa.Function]*
+ 		b.logger.Info("Using parallel call tree computation")
+ 		var wg sync.WaitGroup
+ 		for _, source := range b.inboundsSSA {
++			// Stop accepting new source-exploration work units once canceled.
++			if err := ctx.Err(); err != nil {
++				break
++			}
+ 			wg.Add(1)
+ 			go func(src inbound) {
+ 				defer wg.Done()
+-				processSource(src)
++				_ = processSource(src)
+ 			}(source)
+ 		}
+-		// Wait for all goroutines to complete
++		// Wait for all launched goroutines to converge (in-flight explorations
++		// bail out at the next node/edge/SCCP check; partial results already
++		// sent are ignored by the caller's post-Wait cancellation check).
+ 		wg.Wait()
+ 		close(resultChan)
++		if err := ctx.Err(); err != nil {
++			return nil, fmt.Errorf("graph build canceled: %w", err)
++		}
+ 	}
+ 
+ 	// Merge all results, metrics, and collect errors
+@@ -235,7 +264,12 @@ func (b *builderImpl) buildCallTree(graph *callgraph.Graph) (map[*ssa.Function]*
+ // The caller and callsite in the first edge from in the source function.
+ // THe callee in the last edge contains a sink
+ // The result checks against every sink sinkCallSites and returns a filtered set of feasible callsite in the given path.
+-func (b *builderImpl) checkPathFeasibility(path []*callgraph.Edge, sinkCallSites []ssa.CallInstruction, metrics map[string]float64) ([]ssa.CallInstruction, error) {
++func (b *builderImpl) checkPathFeasibility(ctx context.Context, path []*callgraph.Edge, sinkCallSites []ssa.CallInstruction, metrics map[string]float64) ([]ssa.CallInstruction, error) {
++	// SCCP is the expensive part of sink feasibility; skip it entirely on
++	// cancellation (caller treats the sink infeasible and aborts the tree).
++	if err := ctx.Err(); err != nil {
++		return nil, err
++	}
+ 	if b.config.DisableSCCPAnalysis {
+ 		b.logger.Infow("checkPathFeasibility", "sccp_analysis_disabled", "returning all sink call sites")
+ 		return sinkCallSites, nil
+@@ -266,6 +300,7 @@ func (b *builderImpl) checkPathFeasibility(path []*callgraph.Edge, sinkCallSites
+ 
+ // buildCallTreeNode recursively builds the call tree node for a given function.
+ func (b *builderImpl) buildCallTreeNode(
++	ctx context.Context,
+ 	fn *ssa.Function,
+ 	sinkSet map[*ssa.Function][]ssa.CallInstruction,
+ 	graph *callgraph.Graph,
+@@ -274,6 +309,11 @@ func (b *builderImpl) buildCallTreeNode(
+ 	metrics map[string]float64,
+ 	expState *explorationState,
+ ) (*callgraph.Node, error) {
++	// Cancellation takes precedence over every other early-return: the
++	// enclosing source worker stops exploring and converges immediately.
++	if err := ctx.Err(); err != nil {
++		return nil, err
++	}
+ 	// Check if the function is already in the current path.
+ 	if _, ok := path[fn]; ok {
+ 		return nil, nil // Function repeats on this path; do not include it again.
+@@ -327,7 +367,7 @@ func (b *builderImpl) buildCallTreeNode(
+ 			Callee: nil, // No callee for a sink.
+ 		}
+ 
+-		feasibleCallSites, err := b.checkPathFeasibility(curStack, callsites, metrics)
++		feasibleCallSites, err := b.checkPathFeasibility(ctx, curStack, callsites, metrics)
+ 		// No mutex needed - each shard has its own independent metrics map
+ 		metrics[_constpropCandidatePaths] += float64(len(callsites))
+ 		metrics[_constpropFeasiblePaths] += float64(len(feasibleCallSites))
+@@ -356,6 +396,11 @@ func (b *builderImpl) buildCallTreeNode(
+ 	hasChildren := false
+ 	b.logger.Debugf("num outgoing edges: %d", len(origNode.Out))
+ 	for _, edge := range origNode.Out {
++		// Bail out promptly when canceled rather than exploring the rest of
++		// the (potentially huge) fan-out; the caller waits for this return.
++		if err := ctx.Err(); err != nil {
++			return nil, err
++		}
+ 		calleeFn := edge.Callee.Func
+ 		if slices.Contains(sinkSet[fn], edge.Site) {
+ 			continue // skip the callee that is a sink call site.
+@@ -373,7 +418,7 @@ func (b *builderImpl) buildCallTreeNode(
+ 		// It is critical to use the edge from the original graph, not the one created in the call tree.
+ 		// This is because we will use dontPruneEdges to check if the edge should be pruned.
+ 		curStack[len(curStack)-1] = edge
+-		childNode, err := b.buildCallTreeNode(calleeFn, sinkSet, graph, path, curStack, metrics, expState)
++		childNode, err := b.buildCallTreeNode(ctx, calleeFn, sinkSet, graph, path, curStack, metrics, expState)
+ 		if err != nil {
+ 			return nil, err
+ 		}
+diff --git a/go/graph/graph.go b/go/graph/graph.go
+index b62403f..6a2fb66 100644
+--- a/go/graph/graph.go
++++ b/go/graph/graph.go
+@@ -1,6 +1,7 @@
+ package graph
+ 
+ import (
++	"context"
+ 	"crypto/sha256"
+ 	"encoding/hex"
+ 	"errors"
+@@ -180,6 +181,14 @@ type Config struct {
+ 	// the wrapper-package recipe that lets a real internal package delegate to this one without
+ 	// requiring existing call sites to change their imports.
+ 	SafeGoPkgPath string
++	// Context carries caller cancellation (SIGINT/SIGTERM in the CLI, or a
++	// canceled context from library callers) through RTA, the parallel call
++	// tree, and path collection. When canceled, the builder stops launching
++	// new work, lets started goroutines/workers converge, and Build /
++	// BuildCGOnly return an error wrapping context.Canceled (or
++	// context.DeadlineExceeded). Nil defaults to context.Background(),
++	// preserving the uncanceled behavior every existing caller relies on.
++	Context context.Context
+ }
+ 
+ // builderImpl is a struct that builds a call graph from a set of packages.
+@@ -309,7 +318,30 @@ func NewBuilder(logger *zap.SugaredLogger,
+ 	}
+ }
+ 
++// context returns the builder's cancellation context, or context.Background()
++// when none was configured.
++func (b *builderImpl) context() context.Context {
++	if b.config.Context != nil {
++		return b.config.Context
++	}
++	return context.Background()
++}
++
++// checkCancel returns a recognizable cancellation error when the context is
++// done, otherwise nil. The returned error wraps the underlying context error
++// (context.Canceled / context.DeadlineExceeded) so errors.Is works at every
++// layer (graph, driver, CLI).
++func (b *builderImpl) checkCancel() error {
++	if err := b.context().Err(); err != nil {
++		return fmt.Errorf("graph build canceled: %w", err)
++	}
++	return nil
++}
++
+ func (b *builderImpl) getCG() (*callgraph.Graph, error) {
++	if err := b.checkCancel(); err != nil {
++		return nil, err
++	}
+ 	// Begin clean by forcing GC.
+ 	runtime.GC()
+ 	defer runtime.GC()
+@@ -331,7 +363,7 @@ func (b *builderImpl) getCG() (*callgraph.Graph, error) {
+ 		}
+ 
+ 		start := time.Now()
+-		result, err := b.runSingleFlavor(entry, b.config.RTAFlavor, numWorkers)
++		result, err := b.runSingleFlavor(b.context(), entry, b.config.RTAFlavor, numWorkers)
+ 		if err != nil {
+ 			return nil, err
+ 		}
+@@ -343,6 +375,11 @@ func (b *builderImpl) getCG() (*callgraph.Graph, error) {
+ 		b.logger.Infow("rta_construction", "rss_after_rta_construction", usage)
+ 		b.metrics["rss_after_rta_construction"] = float64(usage)
+ 		if result == nil {
++			// Distinguish cancellation (runSingleFlavor returns a nil graph
++			// with a context error) from an RTA implementation failure.
++			if err := b.checkCancel(); err != nil {
++				return nil, err
++			}
+ 			return nil, errors.New("RTA call graph is nil")
+ 		}
+ 
+@@ -576,6 +613,9 @@ func (b *builderImpl) buildResult() *BuildResult {
+ 
+ // getCallPathsAndCallGraph is a helper function that constructs the call graph and maps AST functions to SSA function nodes.
+ func (b *builderImpl) getCallPathsAndCallGraph() ([]*CallPath, []*CallPath, *callgraph.Graph, error) {
++	if err := b.checkCancel(); err != nil {
++		return nil, nil, nil, err
++	}
+ 	// Compute codebase metrics first (outside of RTA timing)
+ 	b.computeCodebaseMetrics()
+ 
+@@ -598,6 +638,9 @@ func (b *builderImpl) getCallPathsAndCallGraph() ([]*CallPath, []*CallPath, *cal
+ 		b.logger.Errorf("Error getting call graph: %v", err)
+ 		return nil, nil, nil, err
+ 	}
++	if err := b.checkCancel(); err != nil {
++		return nil, nil, nil, err
++	}
+ 
+ 	b.logger.Infof("Analyzing raw call graph")
+ 	gs := b.logGraphStats(cg, _maxCGNodesToLog, zap.InfoLevel)
+@@ -654,6 +697,10 @@ func (b *builderImpl) getCallPathsAndCallGraph() ([]*CallPath, []*CallPath, *cal
+ 
+ 	b.synthesizeMissingInboundNodes(cg)
+ 
++	if err := b.checkCancel(); err != nil {
++		return nil, nil, nil, err
++	}
++
+ 	b.logger.Infof("Building call tree")
+ 	// Now get the calltree from the pruned graph.
+ 	cct, err := b.buildCallTree(cg)
+@@ -661,6 +708,9 @@ func (b *builderImpl) getCallPathsAndCallGraph() ([]*CallPath, []*CallPath, *cal
+ 		b.logger.Errorf("Error building call tree: %v", err)
+ 		return nil, nil, nil, err
+ 	}
++	if err := b.checkCancel(); err != nil {
++		return nil, nil, nil, err
++	}
+ 
+ 	b.logger.Infof("Collecting call paths")
+ 	// collect all call paths.
+diff --git a/go/graph/rtaeval.go b/go/graph/rtaeval.go
+index b5f8b45..6ee3e7a 100644
+--- a/go/graph/rtaeval.go
++++ b/go/graph/rtaeval.go
+@@ -1,6 +1,7 @@
+ package graph
+ 
+ import (
++	"context"
+ 	"crypto/sha256"
+ 	"encoding/hex"
+ 	"errors"
+@@ -265,8 +266,13 @@ func (b *builderImpl) getRTAEntryFunctions() ([]*ssa.Function, error) {
+ }
+ 
+ // runSingleFlavor runs a single RTA flavor with a given worker count and collects all metrics.
+-// It returns the resulting callgraph.
+-func (b *builderImpl) runSingleFlavor(entry []*ssa.Function, flavor RTAFlavor, numWorkers int) (*callgraph.Graph, error) {
++// It returns the resulting callgraph. When ctx is canceled during analysis,
++// the RTA implementation returns a nil result and this returns the
++// cancellation error once its workers have converged.
++func (b *builderImpl) runSingleFlavor(ctx context.Context, entry []*ssa.Function, flavor RTAFlavor, numWorkers int) (*callgraph.Graph, error) {
++	if err := ctx.Err(); err != nil {
++		return nil, fmt.Errorf("graph build canceled: %w", err)
++	}
+ 	// Get baseline memory before this run
+ 	runtime.GC()
+ 	var memStatsBefore runtime.MemStats
+@@ -332,8 +338,11 @@ func (b *builderImpl) runSingleFlavor(entry []*ssa.Function, flavor RTAFlavor, n
+ 			<-memTrackerDone
+ 			return nil, fmt.Errorf("unknown RTA flavor: %s", flavorStr)
+ 		}
+-		opts := append([]rta.AnalyzeOption{rta.WithNumWorkers(numWorkers)}, rtaOpts...)
++		opts := append([]rta.AnalyzeOption{rta.WithNumWorkers(numWorkers), rta.WithContext(ctx)}, rtaOpts...)
+ 		res := rtaImpl.Analyze(entry, true, opts...)
++		// Cancellation: implementations return nil once workers converge.
++		// Fall through to the common measurement cleanup below; the nil
++		// cgResult + ctx check at the end of the function surfaces the error.
+ 		if res != nil {
+ 			cgResult = res.GetCallGraph()
+ 			b.collectRTAMetrics(res, flavorStr, numWorkers)
+@@ -403,6 +412,10 @@ func (b *builderImpl) runSingleFlavor(entry []*ssa.Function, flavor RTAFlavor, n
+ 		b.metrics[fmt.Sprintf("rta_callgraph_edges_%s_%d_workers", flavorStr, numWorkers)] = float64(edgeCount)
+ 	}
+ 
++	if cgResult == nil && ctx.Err() != nil {
++		return nil, fmt.Errorf("graph build canceled: %w", ctx.Err())
++	}
++
+ 	return cgResult, nil
+ }
+ 
+@@ -545,6 +558,10 @@ func ensureStdlibFirst(flavors []RTAFlavor) []RTAFlavor {
+ // buildCGOnlySweep implements the BuildCGOnly logic: sweeps across all configured
+ // flavors and worker counts, collecting metrics. This is only used for benchmarking.
+ func (b *builderImpl) buildCGOnlySweep() (map[string]float64, error) {
++	ctx := b.context()
++	if err := b.checkCancel(); err != nil {
++		return nil, err
++	}
+ 	runtime.GC()
+ 	defer runtime.GC()
+ 
+@@ -589,10 +606,14 @@ func (b *builderImpl) buildCGOnlySweep() (map[string]float64, error) {
+ 		}
+ 
+ 		for workerIdx, numWorkers := range workersToRun {
++			// Do not start another flavor/worker combination after cancellation.
++			if err := ctx.Err(); err != nil {
++				return nil, fmt.Errorf("graph build canceled: %w", err)
++			}
+ 			b.logger.Infof("Running RTA flavor %d/%d, worker config %d/%d: %s with %d workers",
+ 				flavorIdx+1, len(flavors), workerIdx+1, len(workersToRun), flavor, numWorkers)
+ 
+-			cg, err := b.runSingleFlavor(entry, flavor, numWorkers)
++			cg, err := b.runSingleFlavor(ctx, entry, flavor, numWorkers)
+ 			if err != nil {
+ 				b.logger.Errorf("Error running RTA flavor %s: %v", flavor, err)
+ 				return nil, err
+diff --git a/go/graph/rtaeval_test.go b/go/graph/rtaeval_test.go
+index b519e51..a37a738 100644
+--- a/go/graph/rtaeval_test.go
++++ b/go/graph/rtaeval_test.go
+@@ -1,6 +1,7 @@
+ package graph
+ 
+ import (
++	"context"
+ 	"runtime"
+ 	"testing"
+ 
+@@ -426,7 +427,7 @@ func TestRunSingleFlavorCustomRTA(t *testing.T) {
+ 	require.NotEmpty(t, entry)
+ 
+ 	// Run SRTA (a custom flavor that goes through NewImpl).
+-	cg, err := bi.runSingleFlavor(entry, FlavorSRTA, 1)
++	cg, err := bi.runSingleFlavor(context.Background(), entry, FlavorSRTA, 1)
+ 	require.NoError(t, err)
+ 	require.NotNil(t, cg)
+ 	assert.Greater(t, len(cg.Nodes), 0)
+@@ -438,7 +439,7 @@ func TestRunSingleFlavorStdlib(t *testing.T) {
+ 	entry, err := bi.getRTAEntryFunctions()
+ 	require.NoError(t, err)
+ 
+-	cg, err := bi.runSingleFlavor(entry, FlavorStdlib, 1)
++	cg, err := bi.runSingleFlavor(context.Background(), entry, FlavorStdlib, 1)
+ 	require.NoError(t, err)
+ 	require.NotNil(t, cg)
+ 	assert.Greater(t, len(cg.Nodes), 0)
+@@ -450,7 +451,7 @@ func TestRunSingleFlavorCHA(t *testing.T) {
+ 	entry, err := bi.getRTAEntryFunctions()
+ 	require.NoError(t, err)
+ 
+-	cg, err := bi.runSingleFlavor(entry, FlavorCHA, 1)
++	cg, err := bi.runSingleFlavor(context.Background(), entry, FlavorCHA, 1)
+ 	require.NoError(t, err)
+ 	require.NotNil(t, cg)
+ 	assert.Greater(t, len(cg.Nodes), 0)
+@@ -506,10 +507,10 @@ func TestCompareCallGraphsWithRealFunctions(t *testing.T) {
+ 	entry, err := bi.getRTAEntryFunctions()
+ 	require.NoError(t, err)
+ 
+-	cg1, err := bi.runSingleFlavor(entry, FlavorStdlib, 1)
++	cg1, err := bi.runSingleFlavor(context.Background(), entry, FlavorStdlib, 1)
+ 	require.NoError(t, err)
+ 
+-	cg2, err := bi.runSingleFlavor(entry, FlavorSRTA, 1)
++	cg2, err := bi.runSingleFlavor(context.Background(), entry, FlavorSRTA, 1)
+ 	require.NoError(t, err)
+ 
+ 	logger := zap.NewNop().Sugar()
+@@ -523,7 +524,7 @@ func TestComputeNeighborHashWithRealFunctions(t *testing.T) {
+ 	entry, err := bi.getRTAEntryFunctions()
+ 	require.NoError(t, err)
+ 
+-	cg, err := bi.runSingleFlavor(entry, FlavorStdlib, 1)
++	cg, err := bi.runSingleFlavor(context.Background(), entry, FlavorStdlib, 1)
+ 	require.NoError(t, err)
+ 
+ 	bi.computeNeighborHash(cg, "stdlib", 1)
+diff --git a/go/reporting/BUILD.bazel b/go/reporting/BUILD.bazel
+index 753b820..1379566 100644
+--- a/go/reporting/BUILD.bazel
++++ b/go/reporting/BUILD.bazel
+@@ -21,6 +21,7 @@ go_test(
+     name = "go_default_test",
+     size = "large",
+     srcs = [
++        "atomic_write_test.go",
+         "csv_test.go",
+         "html_test.go",
+     ],
+diff --git a/go/reporting/atomic_write_test.go b/go/reporting/atomic_write_test.go
+new file mode 100644
+index 0000000..4220355
+--- /dev/null
++++ b/go/reporting/atomic_write_test.go
+@@ -0,0 +1,56 @@
++package reporting
++
++import (
++	"os"
++	"path/filepath"
++	"testing"
++
++	"github.com/stretchr/testify/require"
++	"github.com/uber-research/rpcshield/go/constant"
++	"github.com/uber-research/rpcshield/go/grail"
++)
++
++// assertNoTmpFiles ensures no leftover temp artifacts in dir after a write.
++func assertNoTmpFiles(t *testing.T, dir string) {
++	t.Helper()
++	matches, err := filepath.Glob(filepath.Join(dir, ".*.tmp-*"))
++	require.NoError(t, err)
++	require.Empty(t, matches, "temporary artifacts left behind: %v", matches)
++}
++
++// TestWriteReportsToCSV_AtomicReplace verifies a successful write atomically
++// replaces a previously generated (possibly complete) CSV and leaves no temp
++// files behind.
++func TestWriteReportsToCSV_AtomicReplace(t *testing.T) {
++	dir := t.TempDir()
++	csvPath := filepath.Join(dir, "svc.csv")
++	require.NoError(t, os.WriteFile(csvPath, []byte("previous trusted complete report\n"), 0644))
++
++	path, rows, err := WriteReportsToCSV(dir, grail.Service{Name: "svc"}, mockReports(), "sha", "ts", constant.SourceForCSV, "repo", "")
++	require.NoError(t, err)
++	require.Equal(t, csvPath, path)
++	require.Greater(t, rows, 0)
++
++	got, err := os.ReadFile(csvPath)
++	require.NoError(t, err)
++	require.NotContains(t, string(got), "previous trusted complete report")
++	require.Contains(t, string(got), "svc", "sanity: header/data present")
++	assertNoTmpFiles(t, dir)
++}
++
++// TestWriteReportsToHTML_AtomicReplace verifies the same atomic-rename
++// guarantee for the HTML artifact.
++func TestWriteReportsToHTML_AtomicReplace(t *testing.T) {
++	dir := t.TempDir()
++	htmlPath := filepath.Join(dir, "ServiceA.html")
++	require.NoError(t, os.WriteFile(htmlPath, []byte("<html>previous</html>"), 0644)
++
++	path, err := WriteReportsToHTML(dir, "ServiceA", mockReports(), "abc123", "2024-11-25T15:04:05Z")
++	require.NoError(t, err)
++	require.Equal(t, htmlPath, path)
++
++	got, err := os.ReadFile(htmlPath)
++	require.NoError(t, err)
++	require.NotContains(t, string(got), "previous")
++	assertNoTmpFiles(t, dir)
++}
+diff --git a/go/reporting/csv.go b/go/reporting/csv.go
+index bf3eda8..f55fe46 100644
+--- a/go/reporting/csv.go
++++ b/go/reporting/csv.go
+@@ -57,23 +57,27 @@ func WriteReportsToCSV(outputDir string, service grail.Service, reports []output
+ 	csvReports := slices.Clone(reports)
+ 	csvReports = append(csvReports, output.Report{ID: output.SyntheticID, Inbound: output.EndPoint{Service: service}, Status: constant.FailUnknown})
+ 
+-	// Create a CSV file in the output directory with the name `<service>.csv`
++	// Create the CSV file in the output directory with the name `<service>.csv`.
++	// Write to a temp file in the same directory and atomically rename it
++	// into place at the end: a failed/canceled write leaves any previously
++	// generated complete CSV untouched instead of truncating it mid-write.
+ 	csvFilePath := filepath.Join(outputDir, fmt.Sprintf("%s.csv", service.Name))
+-
+-	// Open the CSV file
+-	file, err := os.Create(csvFilePath)
++	tmpFile, err := os.CreateTemp(outputDir, fmt.Sprintf(".%s.csv.tmp-*", service.Name))
+ 	if err != nil {
+-		return "", 0, fmt.Errorf("cannot create file: %v", err)
++		return "", 0, fmt.Errorf("cannot create temp file: %v", err)
+ 	}
+-	defer file.Close()
++	tmpPath := tmpFile.Name()
++	// On any failure path, remove the temp file; the final file is only
++	// created by the rename at the end.
++	defer os.Remove(tmpPath)
+ 
+-	writer := csv.NewWriter(file)
+-	defer writer.Flush()
++	writer := csv.NewWriter(tmpFile)
+ 
+ 	var rowsSuccessfullyWritten int
+ 
+ 	// Write CSV header
+ 	if err := writer.Write(header); err != nil {
++		tmpFile.Close()
+ 		return "", 0, fmt.Errorf("cannot write header: %v", err)
+ 	}
+ 	rowsSuccessfullyWritten++
+@@ -127,5 +131,23 @@ func WriteReportsToCSV(outputDir string, service grail.Service, reports []output
+ 		rowsSuccessfullyWritten++
+ 	}
+ 
+-	return csvFilePath, rowsSuccessfullyWritten, dataErr
++	// Flush and surface any buffered write errors before the rename.
++	writer.Flush()
++	if err := writer.Error(); err != nil {
++		dataErr = errors.Join(dataErr, fmt.Errorf("flush csv: %v", err))
++	}
++	if closeErr := tmpFile.Close(); closeErr != nil {
++		dataErr = errors.Join(dataErr, fmt.Errorf("close temp csv: %v", closeErr))
++	}
++
++	// Never promote a partial/failed file over an existing complete report.
++	if dataErr != nil {
++		return "", rowsSuccessfullyWritten, dataErr
++	}
++
++	if err := os.Rename(tmpPath, csvFilePath); err != nil {
++		return "", 0, fmt.Errorf("cannot finalize csv file: %v", err)
++	}
++
++	return csvFilePath, rowsSuccessfullyWritten, nil
+ }
+diff --git a/go/reporting/html.go b/go/reporting/html.go
+index 4968c33..154ed1e 100644
+--- a/go/reporting/html.go
++++ b/go/reporting/html.go
+@@ -46,10 +46,30 @@ func WriteReportsToHTML(outputDir string, service string, reports []output.Repor
+ 		return "", fmt.Errorf("failed to execute HTML template: %v", err)
+ 	}
+ 
+-	// Create an HTML file in the output directory with the name `<service>.html`
++	// Create an HTML file in the output directory with the name `<service>.html`.
+ 	htmlFilePath := filepath.Join(outputDir, getHTMLFileName(service))
+-	if err = os.WriteFile(htmlFilePath, buf.Bytes(), 0644); err != nil {
+-		return "", fmt.Errorf("failed to write HTML content to file: %v", err)
++	// Write to a temp file in the same directory and atomically rename into
++	// place: a failed/canceled write cannot truncate an existing complete HTML
++	// report.
++	tmpFile, err := os.CreateTemp(outputDir, fmt.Sprintf(".%s.html.tmp-*", service))
++	if err != nil {
++		return "", fmt.Errorf("failed to create temp HTML file: %v", err)
++	}
++	tmpPath := tmpFile.Name()
++	defer os.Remove(tmpPath)
++	if _, err := tmpFile.Write(buf.Bytes()); err != nil {
++		tmpFile.Close()
++		return "", fmt.Errorf("failed to write HTML content to temp file: %v", err)
++	}
++	if err := tmpFile.Close(); err != nil {
++		return "", fmt.Errorf("failed to close temp HTML file: %v", err)
++	}
++	// Match os.WriteFile's default permissions (CreateTemp creates 0600).
++	if err := os.Chmod(tmpPath, 0644); err != nil {
++		return "", fmt.Errorf("failed to chmod temp HTML file: %v", err)
++	}
++	if err := os.Rename(tmpPath, htmlFilePath); err != nil {
++		return "", fmt.Errorf("failed to finalize HTML file: %v", err)
+ 	}
+ 	return htmlFilePath, nil
+ }
+diff --git a/go/reporting/html_test.go b/go/reporting/html_test.go
+index 8312350..b60c523 100644
+--- a/go/reporting/html_test.go
++++ b/go/reporting/html_test.go
+@@ -114,5 +114,7 @@ func TestWriteReportsToHTML_FileWriteError(t *testing.T) {
+ 
+ 	_, err := WriteReportsToHTML(invalidDir, "ServiceA", mockReports(), "abc123", "2024-11-25T15:04:05Z")
+ 	require.Error(t, err)
+-	require.Contains(t, err.Error(), "failed to write HTML content to file")
++	// Writes are staged in a temp file in the output dir and atomically
++	// renamed into place, so the failure is at temp-file creation here.
++	require.Contains(t, err.Error(), "failed to create temp HTML file")
+ }
+diff --git a/go/rta/lib.go b/go/rta/lib.go
+index 595c401..dad22c1 100644
+--- a/go/rta/lib.go
++++ b/go/rta/lib.go
+@@ -1,6 +1,7 @@
+ package rta
+ 
+ import (
++	"context"
+ 	"sort"
+ 
+ 	"github.com/uber-research/rpcshield/go/rta/utils"
+@@ -62,11 +63,27 @@ type AnalyzeOption func(*AnalyzeConfig)
+ type AnalyzeConfig struct {
+ 	NumWorkers              int
+ 	MethodSelectionStrategy MethodSelectionStrategy
++
++	// Context carries cancellation into the analysis. When canceled, parallel
++	// implementations stop accepting new work items, wake any sleeping workers,
++	// let in-flight work items converge, and Analyze returns nil. Sequential
++	// implementations bail out of their worklist loops and also return nil.
++	// Callers must inspect Context.Err() (or the surrounding graph-level
++	// error) to distinguish cancellation from "no roots specified".
++	Context context.Context
++}
++
++// ContextOrBackground returns the configured context, or context.Background().
++func (c AnalyzeConfig) ContextOrBackground() context.Context {
++	if c.Context != nil {
++		return c.Context
++	}
++	return context.Background()
+ }
+ 
+ // DefaultAnalyzeConfig returns an AnalyzeConfig with defaults applied, then opts.
+ func DefaultAnalyzeConfig(opts ...AnalyzeOption) AnalyzeConfig {
+-	cfg := AnalyzeConfig{NumWorkers: 1, MethodSelectionStrategy: RarestMethodByConcreteType}
++	cfg := AnalyzeConfig{NumWorkers: 1, MethodSelectionStrategy: RarestMethodByConcreteType, Context: context.Background()}
+ 	for _, o := range opts {
+ 		o(&cfg)
+ 	}
+@@ -89,6 +106,17 @@ func WithMethodSelectionStrategy(s MethodSelectionStrategy) AnalyzeOption {
+ 	return func(c *AnalyzeConfig) { c.MethodSelectionStrategy = s }
+ }
+ 
++// WithContext carries a cancellation context into the RTA analysis. A
++// canceled context makes parallel pools reject new work items, wakes blocked
++// workers, and causes Analyze to return nil once in-flight items converge.
++func WithContext(ctx context.Context) AnalyzeOption {
++	return func(c *AnalyzeConfig) {
++		if ctx != nil {
++			c.Context = ctx
++		}
++	}
++}
++
+ // RTA defines the contract for Rapid Type Analysis implementations.
+ type RTA interface {
+ 	// Analyze performs Rapid Type Analysis starting at the specified root functions.
+diff --git a/go/rta/prta_kumo/impl.go b/go/rta/prta_kumo/impl.go
+index eb2e776..5d44716 100644
+--- a/go/rta/prta_kumo/impl.go
++++ b/go/rta/prta_kumo/impl.go
+@@ -4,6 +4,7 @@
+ package prta_kumo
+ 
+ import (
++	"context"
+ 	"fmt"
+ 	"go/types"
+ 	"runtime"
+@@ -545,9 +546,28 @@ func (a *RTA) Analyze(roots []*ssa.Function, buildCallGraph bool, opts ...rtalib
+ 	r.interfaceTypes.SetHasher(hasher)
+ 
+ 	r.pool.Start(func(item workItem, workerID int) {
++		// After cancellation, queued analysis items are dropped cheaply.
++		// Deduplication items always run, however: they return their
++		// semaphore slots in doWork, and dropping one would deadlock
++		// processNodesInBatches' slot drain.
++		if _, isDedup := item.(*deduplicateEdgesWorkItem); !isDedup && r.pool.IsCancelled() {
++			return
++		}
+ 		item.doWork(r, workerID)
+ 	})
+ 
++	// Bridge context cancellation to the worker pool (see
++	// prta_kumo_nonblocking for the protocol).
++	ctx := cfg.ContextOrBackground()
++	stopWatcher := make(chan struct{})
++	go func() {
++		select {
++		case <-ctx.Done():
++			r.pool.Cancel()
++		case <-stopWatcher:
++		}
++	}()
++
+ 	// Add the initial work to mainbox; workers will steal from it.
+ 	for _, root := range roots {
+ 		r.addReachable(root, false, -1)
+@@ -560,24 +580,37 @@ func (a *RTA) Analyze(roots []*ssa.Function, buildCallGraph bool, opts ...rtalib
+ 	runtime.ReadMemStats(&baselineMem)
+ 	baselineHeapInuse := baselineMem.HeapInuse
+ 
+-	// Wait for RTA-related work to complete
++	// Wait for the main RTA phase to converge (or be canceled).
+ 	r.pool.Wait()
++	if ctx.Err() != nil {
++		// Skip the post-analysis dedup phase entirely on cancellation.
++		close(stopWatcher)
++		r.pool.Stop()
++		return nil
++	}
+ 
+ 	// Record pre-dedup timing and memory
+ 	preDedupDuration := time.Since(analysisStart)
+ 	var preDedupMem runtime.MemStats
+ 	runtime.ReadMemStats(&preDedupMem)
+ 
+-	// De-duplicate edges, using the worker pool with batching
+-	r.processNodesInBatches(numWorkers)
++	// De-duplicate edges, using the worker pool with batching. Stops
++	// submitting new batches if the context is canceled mid-phase.
++	r.processNodesInBatches(ctx, numWorkers)
+ 
+ 	// Record post-dedup timing and memory
+ 	postDedupDuration := time.Since(analysisStart)
+ 	var postDedupMem runtime.MemStats
+ 	runtime.ReadMemStats(&postDedupMem)
+ 
+-	// Signal workers to shut down
++	close(stopWatcher)
++	// Wait for any dedup items still in flight when cancellation lands
++	// during the dedup phase itself, then shut the pool down.
++	r.pool.Wait()
+ 	r.pool.Stop()
++	if ctx.Err() != nil {
++		return nil
++	}
+ 
+ 	// Sum per-worker counters
+ 	r.WorkerCounters.MergeInto(&r.result.BaseMetrics)
+@@ -602,7 +635,13 @@ func (a *RTA) Analyze(roots []*ssa.Function, buildCallGraph bool, opts ...rtalib
+ // doubling memory usage by limiting the number of work items queued at once.
+ // It uses a batch size of 2*numWorkers.
+ // A buffered channel acts as both a semaphore and a slice pool.
+-func (r *rta) processNodesInBatches(numWorkers int) {
++//
++// If ctx is canceled while batches are being submitted, no further batches
++// are submitted. Already-enqueued batches converge via the worker pool
++// (their doWork always returns the semaphore slot); the caller's post-phase
++// pool.Wait then confirms convergence, so this function never blocks on
++// slots belonging to dropped (never-enqueued) submissions.
++func (r *rta) processNodesInBatches(ctx context.Context, numWorkers int) {
+ 	batchSize := numWorkers * 2
+ 
+ 	// Create semaphore channel that holds slices for recycling
+@@ -618,28 +657,48 @@ func (r *rta) processNodesInBatches(numWorkers int) {
+ 
+ 	// Process nodes directly from the map without creating an intermediate slice
+ 	for _, node := range r.result.callGraph.Nodes {
++		// Stop accepting new dedup work units after cancellation. The
++		// held batch slot is abandoned; Analyze discards the partial result.
++		if ctx.Err() != nil {
++			return
++		}
+ 		batch = append(batch, node)
+ 
+ 		// When batch is full, submit it and get a new one
+ 		if len(batch) >= batchSize {
+ 			r.addToWorklist(&deduplicateEdgesWorkItem{nodes: batch, semaphore: semaphore}, -1)
+ 
+-			// Get next slice from semaphore (blocks if all are in use)
+-			batch = <-semaphore
++			// Get next slice from semaphore (blocks if all are in use);
++			// unblock on cancellation since a concurrently-rejected Push
++			// means no item will ever return this slot.
++			select {
++			case batch = <-semaphore:
++			case <-ctx.Done():
++				return
++			}
+ 		}
+ 	}
+ 
+ 	// Submit remaining nodes if any
+-	if len(batch) > 0 {
++	if len(batch) > 0 && ctx.Err() == nil {
+ 		r.addToWorklist(&deduplicateEdgesWorkItem{nodes: batch, semaphore: semaphore}, -1)
+ 	} else {
+ 		// Return unused slice to semaphore
+ 		semaphore <- batch
+ 	}
+ 
+-	// Wait for all batches to complete by draining the semaphore
++	// Wait for all batches to complete by draining the semaphore. Every
++	// enqueued item returns its slot; a submission that raced with
++	// cancellation was dropped inside Push and never held a slot, so drain
++	// without blocking past the items that actually ran.
+ 	for i := 0; i < batchSize; i++ {
+-		<-semaphore
++		select {
++		case <-semaphore:
++		default:
++			// No further slot is coming back (canceled submit or all work
++			// already converged); the caller's pool.Wait confirms accounting.
++			return
++		}
+ 	}
+ }
+ 
+diff --git a/go/rta/prta_kumo_nonblocking/BUILD.bazel b/go/rta/prta_kumo_nonblocking/BUILD.bazel
+index 0b72451..3624556 100644
+--- a/go/rta/prta_kumo_nonblocking/BUILD.bazel
++++ b/go/rta/prta_kumo_nonblocking/BUILD.bazel
+@@ -19,7 +19,7 @@ go_library(
+ 
+ go_test(
+     name = "go_default_test",
+-    srcs = ["impl_test.go"],
++    srcs = ["impl_cancel_test.go", "impl_test.go"],
+     data = [
+         "//exampleapps/rpcshielddemo:rpcshielddemo-anal",
+         "@go_sdk//:files",
+@@ -29,6 +29,8 @@ go_test(
+         "//rta:go_default_library",
+         "//rta/rtatest:go_default_library",
+         "//rta/utils:go_default_library",
++        "@com_github_stretchr_testify//require:go_default_library",
++        "@org_golang_x_tools//go/ssa:go_default_library",
+         "@org_golang_x_tools//go/types/typeutil:go_default_library",
+     ],
+ )
+diff --git a/go/rta/prta_kumo_nonblocking/impl.go b/go/rta/prta_kumo_nonblocking/impl.go
+index 81f55ab..be336db 100644
+--- a/go/rta/prta_kumo_nonblocking/impl.go
++++ b/go/rta/prta_kumo_nonblocking/impl.go
+@@ -784,9 +784,28 @@ func (a *RTA) Analyze(roots []*ssa.Function, buildCallGraph bool, opts ...rtalib
+ 	r.interfaceTypes.SetHasher(hasher)
+ 
+ 	r.pool.Start(func(item workItem, workerID int) {
++		// Dropped cheaply after cancellation: the item is already balanced
++		// by Push/WaitGroup accounting; skipping doWork keeps convergence
++		// prompt regardless of how expensive the item would have been.
++		if r.pool.IsCancelled() {
++			return
++		}
+ 		item.doWork(r, workerID)
+ 	})
+ 
++	// Bridge context cancellation to the worker pool: on ctx cancel, stop
++	// accepting work and wake blocked workers. The watcher exits when
++	// analysis finishes (stopWatcher closed), so it never outlives Analyze.
++	ctx := cfg.ContextOrBackground()
++	stopWatcher := make(chan struct{})
++	go func() {
++		select {
++		case <-ctx.Done():
++			r.pool.Cancel()
++		case <-stopWatcher:
++		}
++	}()
++
+ 	// Add the initial work via the pool's mainbox; workers steal from it.
+ 	for _, root := range roots {
+ 		r.addReachable(root, false, -1)
+@@ -802,6 +821,17 @@ func (a *RTA) Analyze(roots []*ssa.Function, buildCallGraph bool, opts ...rtalib
+ 	// Wait for RTA-related work to complete
+ 	r.pool.Wait()
+ 
++	// Analysis is over (either converged or canceled): release the context
++	// watcher and shut the pool down.
++	close(stopWatcher)
++	r.pool.Stop()
++
++	// A canceled analysis yields no usable result; callers distinguish
++	// cancellation from "no roots" via ctx.Err().
++	if ctx.Err() != nil {
++		return nil
++	}
++
+ 	// Edges are attached directly to node.In / node.Out via per-node mutex
+ 	// inside g.AddCallGraphEdge during the parallel phase; no merge needed.
+ 	//
+@@ -822,9 +852,6 @@ func (a *RTA) Analyze(roots []*ssa.Function, buildCallGraph bool, opts ...rtalib
+ 	postDedupDuration := preDedupDuration
+ 	postDedupMem := preDedupMem
+ 
+-	// Signal workers to shut down
+-	r.pool.Stop()
+-
+ 	// Sum per-worker counters
+ 	r.WorkerCounters.MergeInto(&r.result.BaseMetrics)
+ 
+diff --git a/go/rta/prta_kumo_nonblocking/impl_cancel_test.go b/go/rta/prta_kumo_nonblocking/impl_cancel_test.go
+new file mode 100644
+index 0000000..8bdefcc
+--- /dev/null
++++ b/go/rta/prta_kumo_nonblocking/impl_cancel_test.go
+@@ -0,0 +1,88 @@
++package prta_kumo_nonblocking
++
++import (
++	"context"
++	"go/ast"
++	"go/parser"
++	"go/token"
++	"go/types"
++	"testing"
++
++	"github.com/stretchr/testify/require"
++	rtalib "github.com/uber-research/rpcshield/go/rta"
++	"golang.org/x/tools/go/ssa"
++)
++
++// syntheticProgram builds a tiny in-memory SSA program with a handful of
++// functions, so cancellation tests do not depend on the Bazel-built
++// rpcshielddemo go_path fixture (which only exists under `bazel test`).
++func syntheticProgram(t *testing.T) []*ssa.Function {
++	t.Helper()
++	src := `package p
++
++func a() {}
++func b() {}
++func c() {}
++func main() {}
++`
++	fset := token.NewFileSet()
++	f, err := parser.ParseFile(fset, "p.go", src, 0)
++	require.NoError(t, err)
++
++	tpkg := types.NewPackage("p", "p")
++	info := &types.Info{
++		Types:      make(map[ast.Expr]types.TypeAndValue),
++		Defs:       make(map[*ast.Ident]types.Object),
++		Uses:       make(map[*ast.Ident]types.Object),
++		Implicits:  make(map[ast.Node]types.Object),
++		Selections: make(map[*ast.SelectorExpr]*types.Selection),
++		Scopes:      make(map[ast.Node]*types.Scope),
++	}
++	conf := types.Config{}
++	_, err = conf.Check("p", fset, []*ast.File{f}, info)
++	require.NoError(t, err)
++
++	prog := ssa.NewProgram(fset, ssa.InstantiateGenerics|ssa.GlobalDebug)
++	pkg := prog.CreatePackage(tpkg, []*ast.File{f}, info, true)
++	prog.Build()
++	pkg.Build()
++
++	var roots []*ssa.Function
++	for _, name := range []string{"a", "b", "c", "main"} {
++		fn, ok := pkg.Members[name].(*ssa.Function)
++		require.True(t, ok, "missing function %s", name)
++		roots = append(roots, fn)
++	}
++	return roots
++}
++
++// TestAnalyze_PreCanceledContextReturnsNil verifies the parallel RTA honors
++// cancellation: with a context already canceled, no work units are accepted
++// (Push no-ops), workers are woken and converge, and Analyze returns nil
++// instead of a partial call graph. The graph layer maps nil result + ctx
++// error to its own cancellation error.
++func TestAnalyze_PreCanceledContextReturnsNil(t *testing.T) {
++	entry := syntheticProgram(t)
++
++	ctx, cancel := context.WithCancel(context.Background())
++	cancel()
++
++	res := New().Analyze(entry, true,
++		rtalib.WithNumWorkers(8),
++		rtalib.WithContext(ctx),
++	)
++	require.Nil(t, res, "canceled RTA must return nil, not a partial graph")
++}
++
++// TestAnalyze_UncanceledContextStillSucceeds guards against the cancellation
++// plumbing changing normal behavior when ctx is not canceled.
++func TestAnalyze_UncanceledContextStillSucceeds(t *testing.T) {
++	entry := syntheticProgram(t)
++
++	res := New().Analyze(entry, true,
++		rtalib.WithNumWorkers(4),
++		rtalib.WithContext(context.Background()),
++	)
++	require.NotNil(t, res)
++	require.NotNil(t, res.GetCallGraph())
++}
+diff --git a/go/rta/prta_naive/impl.go b/go/rta/prta_naive/impl.go
+index 2050ea6..be28cfb 100644
+--- a/go/rta/prta_naive/impl.go
++++ b/go/rta/prta_naive/impl.go
+@@ -6,6 +6,7 @@
+ package prta_naive
+ 
+ import (
++	"context"
+ 	"fmt"
+ 	"go/types"
+ 	"runtime"
+@@ -449,9 +450,26 @@ func (a *RTA) Analyze(roots []*ssa.Function, buildCallGraph bool, opts ...rtalib
+ 	r.interfaceTypes.SetHasher(hasher)
+ 
+ 	r.pool.Start(func(item workItem, workerID int) {
++		// Deduplication items always run (they return semaphore slots in
++		// doWork); queued analysis items are dropped cheaply after cancel.
++		if _, isDedup := item.(*deduplicateEdgesWorkItem); !isDedup && r.pool.IsCancelled() {
++			return
++		}
+ 		item.doWork(r, workerID)
+ 	})
+ 
++	// Bridge context cancellation to the worker pool: on cancel, reject new
++	// work units and wake blocked workers; Wait converges in-flight items.
++	ctx := cfg.ContextOrBackground()
++	stopWatcher := make(chan struct{})
++	go func() {
++		select {
++		case <-ctx.Done():
++			r.pool.Cancel()
++		case <-stopWatcher:
++		}
++	}()
++
+ 	// Add the initial work to mainbox; workers will steal from it.
+ 	for _, root := range roots {
+ 		r.addReachable(root, false, -1)
+@@ -464,24 +482,35 @@ func (a *RTA) Analyze(roots []*ssa.Function, buildCallGraph bool, opts ...rtalib
+ 	runtime.ReadMemStats(&baselineMem)
+ 	baselineHeapInuse := baselineMem.HeapInuse
+ 
+-	// Wait for RTA-related work to complete
++	// Wait for the main RTA phase to converge (or be canceled).
+ 	r.pool.Wait()
++	if ctx.Err() != nil {
++		close(stopWatcher)
++		r.pool.Stop()
++		return nil
++	}
+ 
+ 	// Record pre-dedup timing and memory
+ 	preDedupDuration := time.Since(analysisStart)
+ 	var preDedupMem runtime.MemStats
+ 	runtime.ReadMemStats(&preDedupMem)
+ 
+-	// De-duplicate edges, using the worker pool with batching
+-	r.processNodesInBatches(numWorkers)
++	// De-duplicate edges, using the worker pool with batching. Stops
++	// submitting new batches if the context is canceled mid-phase.
++	r.processNodesInBatches(ctx, numWorkers)
+ 
+ 	// Record post-dedup timing and memory
+ 	postDedupDuration := time.Since(analysisStart)
+ 	var postDedupMem runtime.MemStats
+ 	runtime.ReadMemStats(&postDedupMem)
+ 
+-	// Signal workers to shut down
++	close(stopWatcher)
++	// Converge any dedup items still in flight on a mid-phase cancellation.
++	r.pool.Wait()
+ 	r.pool.Stop()
++	if ctx.Err() != nil {
++		return nil
++	}
+ 
+ 	// Sum per-worker counters
+ 	r.WorkerCounters.MergeInto(&r.result.BaseMetrics)
+@@ -503,7 +532,13 @@ func (a *RTA) Analyze(roots []*ssa.Function, buildCallGraph bool, opts ...rtalib
+ // doubling memory usage by limiting the number of work items queued at once.
+ // It uses a batch size of 2*numWorkers.
+ // A buffered channel acts as both a semaphore and a slice pool.
+-func (r *rta) processNodesInBatches(numWorkers int) {
++//
++// If ctx is canceled while batches are being submitted, no further batches
++// are submitted. Already-enqueued batches converge via the worker pool
++// (their doWork always returns the semaphore slot); the caller's post-phase
++// pool.Wait then confirms convergence, so this function never blocks on
++// slots belonging to dropped (never-enqueued) submissions.
++func (r *rta) processNodesInBatches(ctx context.Context, numWorkers int) {
+ 	batchSize := numWorkers * 2
+ 
+ 	// Create semaphore channel that holds slices for recycling
+@@ -519,28 +554,42 @@ func (r *rta) processNodesInBatches(numWorkers int) {
+ 
+ 	// Process nodes directly from the map without creating an intermediate slice
+ 	for _, node := range r.result.callGraph.Nodes {
++		// Stop accepting new dedup work units after cancellation.
++		if ctx.Err() != nil {
++			return
++		}
+ 		batch = append(batch, node)
+ 
+ 		// When batch is full, submit it and get a new one
+ 		if len(batch) >= batchSize {
+ 			r.addToWorklist(&deduplicateEdgesWorkItem{nodes: batch, semaphore: semaphore}, -1)
+ 
+-			// Get next slice from semaphore (blocks if all are in use)
+-			batch = <-semaphore
++			// Get next slice from semaphore; unblock on cancellation since a
++			// concurrently-rejected Push will never return this slot.
++			select {
++			case batch = <-semaphore:
++			case <-ctx.Done():
++				return
++			}
+ 		}
+ 	}
+ 
+ 	// Submit remaining nodes if any
+-	if len(batch) > 0 {
++	if len(batch) > 0 && ctx.Err() == nil {
+ 		r.addToWorklist(&deduplicateEdgesWorkItem{nodes: batch, semaphore: semaphore}, -1)
+ 	} else {
+ 		// Return unused slice to semaphore
+ 		semaphore <- batch
+ 	}
+ 
+-	// Wait for all batches to complete by draining the semaphore
++	// Drain slots without blocking past items that actually ran; the
++	// caller's pool.Wait confirms full convergence.
+ 	for i := 0; i < batchSize; i++ {
+-		<-semaphore
++		select {
++		case <-semaphore:
++		default:
++			return
++		}
+ 	}
+ }
+ 
+diff --git a/go/rta/prta_nonblocking/impl.go b/go/rta/prta_nonblocking/impl.go
+index bbd02fe..9cb03ab 100644
+--- a/go/rta/prta_nonblocking/impl.go
++++ b/go/rta/prta_nonblocking/impl.go
+@@ -4,6 +4,7 @@
+ package prta_nonblocking
+ 
+ import (
++	"context"
+ 	"fmt"
+ 	"go/types"
+ 	"runtime"
+@@ -444,9 +445,26 @@ func (a *RTA) Analyze(roots []*ssa.Function, buildCallGraph bool, opts ...rtalib
+ 	r.interfaceTypes.SetHasher(hasher)
+ 
+ 	r.pool.Start(func(item workItem, workerID int) {
++		// Deduplication items always run (they return semaphore slots in
++		// doWork); queued analysis items are dropped cheaply after cancel.
++		if _, isDedup := item.(*deduplicateEdgesWorkItem); !isDedup && r.pool.IsCancelled() {
++			return
++		}
+ 		item.doWork(r, workerID)
+ 	})
+ 
++	// Bridge context cancellation to the worker pool: on cancel, reject new
++	// work units and wake blocked workers; Wait converges in-flight items.
++	ctx := cfg.ContextOrBackground()
++	stopWatcher := make(chan struct{})
++	go func() {
++		select {
++		case <-ctx.Done():
++			r.pool.Cancel()
++		case <-stopWatcher:
++		}
++	}()
++
+ 	// Add the initial work to mainbox; workers will steal from it.
+ 	for _, root := range roots {
+ 		r.addReachable(root, false, -1)
+@@ -459,8 +477,13 @@ func (a *RTA) Analyze(roots []*ssa.Function, buildCallGraph bool, opts ...rtalib
+ 	runtime.ReadMemStats(&baselineMem)
+ 	baselineHeapInuse := baselineMem.HeapInuse
+ 
+-	// Wait for RTA-related work to complete
++	// Wait for the main RTA phase to converge (or be canceled).
+ 	r.pool.Wait()
++	if ctx.Err() != nil {
++		close(stopWatcher)
++		r.pool.Stop()
++		return nil
++	}
+ 
+ 	// Record pre-dedup timing and memory
+ 	preDedupDuration := time.Since(analysisStart)
+@@ -469,16 +492,22 @@ func (a *RTA) Analyze(roots []*ssa.Function, buildCallGraph bool, opts ...rtalib
+ 
+ 	// Populate result callgraph
+ 
+-	// De-duplicate edges, using the worker pool with batching
+-	r.processNodesInBatches(numWorkers)
++	// De-duplicate edges, using the worker pool with batching. Stops
++	// submitting new batches if the context is canceled mid-phase.
++	r.processNodesInBatches(ctx, numWorkers)
+ 
+ 	// Record post-dedup timing and memory
+ 	postDedupDuration := time.Since(analysisStart)
+ 	var postDedupMem runtime.MemStats
+ 	runtime.ReadMemStats(&postDedupMem)
+ 
+-	// Signal workers to shut down
++	close(stopWatcher)
++	// Converge any dedup items still in flight on a mid-phase cancellation.
++	r.pool.Wait()
+ 	r.pool.Stop()
++	if ctx.Err() != nil {
++		return nil
++	}
+ 
+ 	// Sum per-worker counters
+ 	r.WorkerCounters.MergeInto(&r.result.BaseMetrics)
+@@ -500,7 +529,13 @@ func (a *RTA) Analyze(roots []*ssa.Function, buildCallGraph bool, opts ...rtalib
+ // doubling memory usage by limiting the number of work items queued at once.
+ // It uses a batch size of 2*numWorkers.
+ // A buffered channel acts as both a semaphore and a slice pool.
+-func (r *rta) processNodesInBatches(numWorkers int) {
++//
++// If ctx is canceled while batches are being submitted, no further batches
++// are submitted. Already-enqueued batches converge via the worker pool
++// (their doWork always returns the semaphore slot); the caller's post-phase
++// pool.Wait then confirms convergence, so this function never blocks on
++// slots belonging to dropped (never-enqueued) submissions.
++func (r *rta) processNodesInBatches(ctx context.Context, numWorkers int) {
+ 	batchSize := numWorkers * 2
+ 
+ 	// Create semaphore channel that holds slices for recycling
+@@ -519,28 +554,42 @@ func (r *rta) processNodesInBatches(numWorkers int) {
+ 
+ 	// Process nodes directly from the map without creating an intermediate slice
+ 	for _, node := range cg.Nodes {
++		// Stop accepting new dedup work units after cancellation.
++		if ctx.Err() != nil {
++			return
++		}
+ 		batch = append(batch, node)
+ 
+ 		// When batch is full, submit it and get a new one
+ 		if len(batch) >= batchSize {
+ 			r.addToWorklist(&deduplicateEdgesWorkItem{nodes: batch, semaphore: semaphore}, -1)
+ 
+-			// Get next slice from semaphore (blocks if all are in use)
+-			batch = <-semaphore
++			// Get next slice from semaphore; unblock on cancellation since a
++			// concurrently-rejected Push will never return this slot.
++			select {
++			case batch = <-semaphore:
++			case <-ctx.Done():
++				return
++			}
+ 		}
+ 	}
+ 
+ 	// Submit remaining nodes if any
+-	if len(batch) > 0 {
++	if len(batch) > 0 && ctx.Err() == nil {
+ 		r.addToWorklist(&deduplicateEdgesWorkItem{nodes: batch, semaphore: semaphore}, -1)
+ 	} else {
+ 		// Return unused slice to semaphore
+ 		semaphore <- batch
+ 	}
+ 
+-	// Wait for all batches to complete by draining the semaphore
++	// Drain slots without blocking past items that actually ran; the
++	// caller's pool.Wait confirms full convergence.
+ 	for i := 0; i < batchSize; i++ {
+-		<-semaphore
++		select {
++		case <-semaphore:
++		default:
++			return
++		}
+ 	}
+ }
+ 
+diff --git a/go/rta/srta/BUILD.bazel b/go/rta/srta/BUILD.bazel
+index 9ef4ed9..0d368ea 100644
+--- a/go/rta/srta/BUILD.bazel
++++ b/go/rta/srta/BUILD.bazel
+@@ -18,11 +18,16 @@ go_library(
+ 
+ go_test(
+     name = "go_default_test",
+-    srcs = ["impl_test.go"],
++    srcs = ["impl_cancel_test.go", "impl_test.go"],
+     data = [
+         "//exampleapps/rpcshielddemo:rpcshielddemo-anal",
+         "@go_sdk//:files",
+     ],
+     embed = [":go_default_library"],
+-    deps = ["//rta/rtatest:go_default_library"],
++    deps = [
++        "//rta:go_default_library",
++        "//rta/rtatest:go_default_library",
++        "@com_github_stretchr_testify//require:go_default_library",
++        "@org_golang_x_tools//go/ssa:go_default_library",
++    ],
+ )
+diff --git a/go/rta/srta/impl.go b/go/rta/srta/impl.go
+index 45624a9..d5501e7 100644
+--- a/go/rta/srta/impl.go
++++ b/go/rta/srta/impl.go
+@@ -327,6 +327,8 @@ func (a *RTA) Analyze(roots []*ssa.Function, buildCallGraph bool, opts ...rtalib
+ 		return nil
+ 	}
+ 
++	cfg := rtalib.DefaultAnalyzeConfig(opts...)
++
+ 	r := &rta{
+ 		reachable: make(map[*ssa.Function]struct{ AddrTaken bool }),
+ 		result:    &Result{},
+@@ -362,8 +364,12 @@ func (a *RTA) Analyze(roots []*ssa.Function, buildCallGraph bool, opts ...rtalib
+ 	// Visit functions, processing their instructions, and adding
+ 	// new functions to the worklist, until a fixed point is
+ 	// reached.
++	ctx := cfg.ContextOrBackground()
+ 	var shadow []*ssa.Function // for efficiency, we double-buffer the worklist
+ 	for len(r.worklist) > 0 {
++		if ctx.Err() != nil {
++			return nil
++		}
+ 		shadow, r.worklist = r.worklist, shadow[:0]
+ 		for _, f := range shadow {
+ 			r.visitFunc(f)
+diff --git a/go/rta/srta/impl_cancel_test.go b/go/rta/srta/impl_cancel_test.go
+new file mode 100644
+index 0000000..a732068
+--- /dev/null
++++ b/go/rta/srta/impl_cancel_test.go
+@@ -0,0 +1,70 @@
++package srta
++
++import (
++	"context"
++	"go/ast"
++	"go/parser"
++	"go/token"
++	"go/types"
++	"testing"
++
++	"github.com/stretchr/testify/require"
++	rtalib "github.com/uber-research/rpcshield/go/rta"
++	"golang.org/x/tools/go/ssa"
++)
++
++// syntheticSRTAProgram builds a tiny in-memory SSA program so the
++// cancellation test does not depend on the Bazel-built rpcshielddemo
++// go_path fixture (only present under `bazel test`).
++func syntheticSRTAProgram(t *testing.T) []*ssa.Function {
++	t.Helper()
++	src := `package p
++
++func a() {}
++func b() {}
++func c() {}
++func main() {}
++`
++	fset := token.NewFileSet()
++	f, err := parser.ParseFile(fset, "p.go", src, 0)
++	require.NoError(t, err)
++
++	tpkg := types.NewPackage("p", "p")
++	info := &types.Info{
++		Types:      make(map[ast.Expr]types.TypeAndValue),
++		Defs:       make(map[*ast.Ident]types.Object),
++		Uses:       make(map[*ast.Ident]types.Object),
++		Implicits:  make(map[ast.Node]types.Object),
++		Selections: make(map[*ast.SelectorExpr]*types.Selection),
++		Scopes:      make(map[ast.Node]*types.Scope),
++	}
++	conf := types.Config{}
++	_, err = conf.Check("p", fset, []*ast.File{f}, info)
++	require.NoError(t, err)
++
++	prog := ssa.NewProgram(fset, ssa.InstantiateGenerics|ssa.GlobalDebug)
++	pkg := prog.CreatePackage(tpkg, []*ast.File{f}, info, true)
++	prog.Build()
++	pkg.Build()
++
++	var roots []*ssa.Function
++	for _, name := range []string{"a", "b", "c", "main"} {
++		fn, ok := pkg.Members[name].(*ssa.Function)
++		require.True(t, ok, "missing function %s", name)
++		roots = append(roots, fn)
++	}
++	return roots
++}
++
++// TestAnalyze_PreCanceledContextReturnsNil verifies the serial RTA worklist
++// bails out on a canceled context and returns nil, instead of finishing the
++// fixed-point iteration and returning a partial graph.
++func TestAnalyze_PreCanceledContextReturnsNil(t *testing.T) {
++	entry := syntheticSRTAProgram(t)
++
++	ctx, cancel := context.WithCancel(context.Background())
++	cancel()
++
++	res := New().Analyze(entry, true, rtalib.WithContext(ctx))
++	require.Nil(t, res, "canceled serial RTA must return nil")
++}
+diff --git a/go/rta/srta_kumo/impl.go b/go/rta/srta_kumo/impl.go
+index c4407f8..30794f5 100644
+--- a/go/rta/srta_kumo/impl.go
++++ b/go/rta/srta_kumo/impl.go
+@@ -611,8 +611,12 @@ func (a *RTA) Analyze(roots []*ssa.Function, buildCallGraph bool, opts ...rtalib
+ 	// Visit functions, processing their instructions, and adding
+ 	// new functions to the worklist, until a fixed point is
+ 	// reached.
++	ctx := cfg.ContextOrBackground()
+ 	var shadow []*ssa.Function // for efficiency, we double-buffer the worklist
+ 	for len(r.worklist) > 0 {
++		if ctx.Err() != nil {
++			return nil
++		}
+ 		shadow, r.worklist = r.worklist, shadow[:0]
+ 		for _, f := range shadow {
+ 			r.visitFunc(f)
+diff --git a/go/rta/srta_opt/impl.go b/go/rta/srta_opt/impl.go
+index 9ba9bc0..4270601 100644
+--- a/go/rta/srta_opt/impl.go
++++ b/go/rta/srta_opt/impl.go
+@@ -431,6 +431,8 @@ func (a *RTA) Analyze(roots []*ssa.Function, buildCallGraph bool, opts ...rtalib
+ 		return nil
+ 	}
+ 
++	cfg := rtalib.DefaultAnalyzeConfig(opts...)
++
+ 	r := &rta{
+ 		reachable:        make(map[*ssa.Function]struct{ AddrTaken bool }),
+ 		result:           &Result{},
+@@ -466,8 +468,12 @@ func (a *RTA) Analyze(roots []*ssa.Function, buildCallGraph bool, opts ...rtalib
+ 	// Visit functions, processing their instructions, and adding
+ 	// new functions to the worklist, until a fixed point is
+ 	// reached.
++	ctx := cfg.ContextOrBackground()
+ 	var shadow []*ssa.Function // for efficiency, we double-buffer the worklist
+ 	for len(r.worklist) > 0 {
++		if ctx.Err() != nil {
++			return nil
++		}
+ 		shadow, r.worklist = r.worklist, shadow[:0]
+ 		for _, f := range shadow {
+ 			r.visitFunc(f)
+diff --git a/go/rta/srta_struct/impl.go b/go/rta/srta_struct/impl.go
+index 4984020..f1dcaff 100644
+--- a/go/rta/srta_struct/impl.go
++++ b/go/rta/srta_struct/impl.go
+@@ -339,6 +339,8 @@ func (a *RTA) Analyze(roots []*ssa.Function, buildCallGraph bool, opts ...rtalib
+ 		return nil
+ 	}
+ 
++	cfg := rtalib.DefaultAnalyzeConfig(opts...)
++
+ 	r := &rta{
+ 		reachable:        make(map[*ssa.Function]struct{ AddrTaken bool }),
+ 		result:           &Result{},
+@@ -375,8 +377,12 @@ func (a *RTA) Analyze(roots []*ssa.Function, buildCallGraph bool, opts ...rtalib
+ 	// Visit functions, processing their instructions, and adding
+ 	// new functions to the worklist, until a fixed point is
+ 	// reached.
++	ctx := cfg.ContextOrBackground()
+ 	var shadow []*ssa.Function // for efficiency, we double-buffer the worklist
+ 	for len(r.worklist) > 0 {
++		if ctx.Err() != nil {
++			return nil
++		}
+ 		shadow, r.worklist = r.worklist, shadow[:0]
+ 		for _, f := range shadow {
+ 			r.visitFunc(f)
+diff --git a/go/rta/utils/BUILD.bazel b/go/rta/utils/BUILD.bazel
+index e82421f..1cc0bc9 100644
+--- a/go/rta/utils/BUILD.bazel
++++ b/go/rta/utils/BUILD.bazel
+@@ -40,6 +40,7 @@ go_test(
+         "methodvalue_concurrent_test.go",
+         "methodvalue_test.go",
+         "pmap_test.go",
++        "workerpool_cancel_test.go",
+         "workerpool_test.go",
+     ],
+     embed = [":go_default_library"],
+diff --git a/go/rta/utils/workerpool.go b/go/rta/utils/workerpool.go
+index 8ac495a..61bacc9 100644
+--- a/go/rta/utils/workerpool.go
++++ b/go/rta/utils/workerpool.go
+@@ -51,6 +51,17 @@ type WorkerPool[T any] struct {
+ 	numSleeping atomic.Int32
+ 	wakeup      chan struct{}
+ 
++	// cancelCh is closed once by Cancel. A closed cancelCh makes Push a
++	// no-op (no workWg.Add, no enqueue -- no new work units are accepted)
++	// and wakes every worker blocked in the sleep select so they drain
++	// already-queued items (the do callback drops them cheaply when pools
++	// are canceled) instead of waiting for producer signals. In-flight work
++	// items always run to completion, and queued items are always accounted
++	// in workWg, so Wait still converges to zero after cancellation; Stop
++	// then lets the workers exit.
++	cancelCh   chan struct{}
++	cancelOnce sync.Once
++
+ 	numWorkers int
+ 	rngs       []PaddedRand
+ 
+@@ -69,6 +80,7 @@ func NewWorkerPool[T any](numWorkers int) *WorkerPool[T] {
+ 		mainbox:    chaselev.New[T](),
+ 		workDone:   make(chan struct{}),
+ 		wakeup:     make(chan struct{}, numWorkers),
++		cancelCh:   make(chan struct{}),
+ 		numWorkers: numWorkers,
+ 		rngs:       make([]PaddedRand, numWorkers),
+ 	}
+@@ -105,8 +117,22 @@ func (p *WorkerPool[T]) WorkerRand(i int) *rand.Rand {
+ //
+ // Each Push increments an internal WaitGroup that is decremented after the
+ // item's DoWork callback returns. Wait blocks until the counter reaches zero.
++//
++// After Cancel, Push is a no-op: the item is neither counted nor enqueued, so
++// canceled producers cannot extend the analysis with new work units and Wait
++// only has to wait for already-started items to converge.
+ func (p *WorkerPool[T]) Push(item T, workerID int) {
++	if p.IsCancelled() {
++		return
++	}
+ 	p.workWg.Add(1)
++	// Re-check after Add: a concurrent Cancel may win while this Push is in
++	// flight. Balance the Add we just made and drop the item rather than
++	// letting canceled work reach a worker.
++	if p.IsCancelled() {
++		p.workWg.Done()
++		return
++	}
+ 	if workerID >= 0 {
+ 		p.workQueues[workerID].Push(item)
+ 	} else {
+@@ -128,6 +154,41 @@ func (p *WorkerPool[T]) Push(item T, workerID int) {
+ 	}
+ }
+ 
++// Cancel closes the pool's cancellation channel exactly once. It stops the
++// pool from accepting new work units and wakes every worker blocked in the
++// sleep select so already-queued items get drained (the do callback can skip
++// them cheaply via IsCancelled). It does NOT interrupt work items already
++// running -- those run to completion and, like drained items, balance the
++// WaitGroup as usual. Typical usage: drive Cancel from a context watcher,
++// then Wait until the pool converges, then Stop.
++func (p *WorkerPool[T]) Cancel() {
++	p.cancelOnce.Do(func() {
++		close(p.cancelCh)
++		// Wake all sleeping workers so they observe cancelCh immediately
++		// instead of waiting for a producer signal.
++		for p.numSleeping.Load() > 0 {
++			select {
++			case p.wakeup <- struct{}{}:
++			default:
++				// Surplus signals drop; workers also select on cancelCh
++				// directly and at the top of the steal loop.
++				goto done
++			}
++		}
++	done:
++	})
++}
++
++// IsCancelled reports whether Cancel has been called.
++func (p *WorkerPool[T]) IsCancelled() bool {
++	select {
++	case <-p.cancelCh:
++		return true
++	default:
++		return false
++	}
++}
++
+ // Start spawns numWorkers goroutines and stores do as the per-item callback.
+ // Each worker runs Pop on its own deque, Steals from peers and the mainbox,
+ // and blocks on wakeup when idle. Workers exit when Stop closes workDone.
+@@ -232,6 +293,9 @@ func (p *WorkerPool[T]) workerLoop(i int) {
+ 
+ 		select {
+ 		case <-p.wakeup:
++			// Woken by a producer or by Cancel. Either way, loop back and
++			// drain the queues: after Cancel, the do-callback drops items
++			// cheaply while Push rejects new ones, so the pool converges.
+ 		case _, ok := <-p.workDone:
+ 			p.numSleeping.Add(-1)
+ 			if !ok {
+diff --git a/go/rta/utils/workerpool_cancel_test.go b/go/rta/utils/workerpool_cancel_test.go
+new file mode 100644
+index 0000000..79ae506
+--- /dev/null
++++ b/go/rta/utils/workerpool_cancel_test.go
+@@ -0,0 +1,114 @@
++package utils
++
++import (
++	"runtime"
++	"sync"
++	"sync/atomic"
++	"testing"
++	"time"
++
++	"github.com/stretchr/testify/require"
++)
++
++// waitForSleeping polls until the pool reports n sleeping workers, failing
++// the test after a deadline. Workers sleep only after failing two steal
++// rounds, so this takes at most a few scheduler slices.
++func waitForSleeping[T any](t *testing.T, p *WorkerPool[T], n int32) {
++	t.Helper()
++	deadline := time.Now().Add(5 * time.Second)
++	for time.Now().Before(deadline) {
++		if p.numSleeping.Load() == n {
++			return
++		}
++		runtime.Gosched()
++	}
++	require.Equal(t, n, p.numSleeping.Load(), "timed out waiting for %d sleeping workers", n)
++}
++
++// TestWorkerPool_CancelWakesBlockedWorkersAndConverges deterministically
++// exercises the "graph worker blocked" cancellation scenario:
++//   - one work item is in flight (blocked on a gate), the other workers sleep;
++//   - more items are queued behind the blocked one;
++//   - Cancel() rejects every new Push, wakes the sleeping workers, and the
++//     already-queued items get drained (dropped cheaply);
++//   - after the in-flight item is released, Wait() returns -- all started
++//     workers converged, no unit is lost from WaitGroup accounting.
++func TestWorkerPool_CancelWakesBlockedWorkersAndConverges(t *testing.T) {
++	const nWorkers = 4
++	p := NewWorkerPool[int](nWorkers)
++
++	var ran atomic.Int32
++	releaseBlocker := make(chan struct{})
++	blockerStarted := make(chan struct{})
++	var startOnce sync.Once
++
++	p.Start(func(item int, _ int) {
++		if p.IsCancelled() {
++			return
++		}
++		if item == 0 {
++			startOnce.Do(func() { close(blockerStarted) })
++			<-releaseBlocker // in-flight item blocks here until canceled/released
++		}
++		ran.Add(1)
++	})
++
++	// One in-flight blocker; the other nWorkers-1 workers eventually sleep.
++	p.Push(0, -1)
++	<-blockerStarted
++	waitForSleeping(t, p, nWorkers-1)
++
++	// Items queued while workers sleep (all accounted by the WaitGroup).
++	for i := 1; i <= 6; i++ {
++		p.Push(i, -1)
++	}
++
++	p.Cancel()
++	require.True(t, p.IsCancelled())
++
++	// New work units are rejected after cancellation: WaitGroup accounting
++	// must not move, and the item must never reach a worker.
++	p.Push(99, -1)
++
++	// Releasing the in-flight item lets it converge; woken workers drain the
++	// queued items (the do callback drops them cheaply). Wait must return.
++	close(releaseBlocker)
++	done := make(chan struct{})
++	go func() { p.Wait(); close(done) }()
++	select {
++	case <-done:
++	case <-time.After(5 * time.Second):
++		t.Fatal("Wait() did not converge after Cancel -- a work unit was stranded")
++	}
++	p.Stop()
++
++	// The in-flight item always ran; dropped/drained items may or may not,
++	// but the rejected item 99 never could.
++	require.GreaterOrEqual(t, ran.Load(), int32(1))
++}
++
++// TestWorkerPool_CancelWhileAllSleeping verifies the case where Cancel lands
++// when every worker is blocked in the sleep select with no queued work: they
++// must be woken (so a subsequent Stop is immediate) and Push stays rejected.
++func TestWorkerPool_CancelWhileAllSleeping(t *testing.T) {
++	const nWorkers = 3
++	p := NewWorkerPool[int](nWorkers)
++	p.Start(func(item int, _ int) {})
++
++	waitForSleeping(t, p, nWorkers)
++	p.Cancel()
++
++	// Wait on an empty pool returns immediately before and after cancel.
++	p.Wait()
++
++	stopped := make(chan struct{})
++	go func() { p.Stop(); close(stopped) }()
++	select {
++	case <-stopped:
++	case <-time.After(5 * time.Second):
++		t.Fatal("Stop() hung: sleeping workers were not woken by Cancel")
++	}
++
++	// Double Cancel is a no-op (idempotent).
++	p.Cancel()
++}
+diff --git a/go/rtabench.go b/go/rtabench.go
+index 9325dc2..a144b69 100644
+--- a/go/rtabench.go
++++ b/go/rtabench.go
+@@ -1,6 +1,7 @@
+ package rpcshield
+ 
+ import (
++	"context"
+ 	"slices"
+ 	"time"
+ 
+@@ -13,6 +14,7 @@ import (
+ // runCGConstructionOnly runs CG construction-only evaluation for benchmarking.
+ // It builds the call graph without outbound detection or path analysis.
+ func (d *Driver) runCGConstructionOnly(
++	ctx context.Context,
+ 	pkgs []*packages.Package,
+ 	ssaProg *ssa.Program,
+ 	ssaPkgs []*ssa.Package,
+@@ -49,6 +51,7 @@ func (d *Driver) runCGConstructionOnly(
+ 		RTABenchFlavors:         rtaBenchFlavors,
+ 		RTABenchNumWorkers:      rtaBenchNumWorkers,
+ 		CheckIsomorphism:        d.opts.CheckIsomorphism,
++		Context:                 ctx,
+ 	}
+ 	d.Logger.Infow("Graph config", "config", graphConfig)
+ 
