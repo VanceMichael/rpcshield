@@ -23,6 +23,14 @@ import (
 	"golang.org/x/tools/go/packages"
 )
 
+// ErrFxScanFailed wraps fatal FxScanner failures that invalidate the whole
+// scan (e.g. the workspace walk itself fails), as opposed to tolerated
+// per-package diagnostics (unresolved client constructors, individual package
+// load errors). Callers that refresh an atomic registry generation must abort
+// the refresh when errors.Is(err, ErrFxScanFailed) and keep the previous
+// complete generation; non-fatal diagnostics still leave a usable mapping.
+var ErrFxScanFailed = errors.New("fx workspace scan failed")
+
 type errCannotResolve struct {
 	clientType FullyQualifiedType
 	code       string
@@ -139,7 +147,9 @@ func (f *FxScanner) Mappings() (ServiceMapping, error) {
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
-		sendErr = collectGoDirs(f.workspace, f.codebasePkgPrefix, jobsChan)
+		if err := collectGoDirs(f.workspace, f.codebasePkgPrefix, jobsChan); err != nil {
+			sendErr = fmt.Errorf("%w: %w", ErrFxScanFailed, err)
+		}
 	}()
 
 	// Start the worker pool.

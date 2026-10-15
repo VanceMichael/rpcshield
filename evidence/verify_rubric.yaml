@@ -1,0 +1,25 @@
+rubrics:
+  - id: 1
+    type: f2p
+    text: 默认服务注册缓存拥有版本化 manifest 或等价 generation 身份；refresh 在非活动位置完整取得 services 与 network groups，并用这组 services 和 network groups 重建 Fx client mapping，三者全部校验成功才原子选择新代。
+  - id: 2
+    type: f2p
+    text: services 获取成功后若 network groups、Fx 扫描、编码、同步或发布失败，活动 generation 不前移；下一次 auto 仍得到上一代 services 与 mapping，故障解除后的 refresh 才共同换代。
+  - id: 3
+    type: f2p
+    text: auto 检测到活动 manifest 缺件、hash 或 generation 不符、JSON 截断或 schema 不支持时，不向 ServiceMapper 交付候选；有最后有效 generation 则记录回退并使用它，没有可恢复 generation 才返回指出具体组件的确定错误。
+  - id: 4
+    type: f2p
+    text: 两个进程并发 refresh 同一 workspace 时，写入和活动 generation 切换受到跨进程协调；读者始终获得完整旧代或完整新代，最终缓存可解析且不会让一个进程的 services 与另一个进程的 Fx mapping 配对。
+  - id: 5
+    type: f2p
+    text: ServiceRegistry 返回的 Services、NetworkGroups 和 ClientTypeMapping 关联同一 generation；WPA 的 result 或 run metrics 能稳定给出 generation ID、组件来源以及正常命中、刷新或回退状态。
+  - id: 6
+    type: p2p
+    text: 显式 services 或 Fx mapping 文件参数仍按现有语义只读解析，不被移动、重写或纳入共享清理；显式损坏文件继续针对该路径报错，合法的混合显式输入具有可追溯身份。
+  - id: 7
+    type: p2p
+    text: 没有 manifest 的旧版 grail_all_services.json 与 fx_mappings.json 能在保持 auto 新鲜度语义的前提下兼容读取或安全接管；定制 ServiceRegistryProvider 不被强制采用默认磁盘 generation。
+  - id: 8
+    type: p2p
+    text: keep-inbound、生产流量和 tier override 继续按各自现有参数与运行时覆盖语义独立解析，不被写入服务注册 generation；没有故障时的 ownership、tier clipping、traffic skip、inbound 过滤和报告行为保持兼容。

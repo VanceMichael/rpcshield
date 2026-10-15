@@ -306,6 +306,12 @@ func Run(options Options) (rpcshield.Result, error) {
 	if err != nil {
 		return rpcshield.Result{}, fmt.Errorf("provide service registry: %w", err)
 	}
+	logger.Infow("Using service registry",
+		"generation", registry.Meta.Generation,
+		"components", registry.Meta.Components,
+		"fell_back", registry.Meta.FellBack,
+		"fallback_reason", registry.Meta.FallbackReason,
+	)
 	allServices := registry.Services
 
 	// Apply tier overrides if provided.
@@ -399,7 +405,7 @@ func Run(options Options) (rpcshield.Result, error) {
 	driver := rpcshield.NewDriver(options.Workspace, runner, gp, serviceMapper, genai.New(options.GenAIBaseURL, options.GenAIAPIUSSOToken), allServices, productionTrafficRecords, logger, driverOpts)
 
 	result, err := driver.Run(ctx, options.Service)
-	values := getStatsMetrics(result, options, err)
+	values := getStatsMetrics(result, options, err, registry.Meta)
 	logger.Infow("wpa_metrics", zap.Any("metrics", values))
 
 	if options.ReportMetrics && options.ReportResult == nil {
@@ -416,6 +422,7 @@ func Run(options Options) (rpcshield.Result, error) {
 			"csv_file_path":  result.CSVFilePath,
 			"html_file_path": result.HTMLFilePath,
 		}
+		maps.Copy(values, registryMetricValues(registry.Meta))
 		if err != nil {
 			values["error"] = err.Error()
 		}
@@ -492,7 +499,7 @@ func Run(options Options) (rpcshield.Result, error) {
 	return result, err
 }
 
-func getStatsMetrics(result rpcshield.Result, options Options, err error) map[string]string {
+func getStatsMetrics(result rpcshield.Result, options Options, err error, registryMeta serviceregistry.RegistryMeta) map[string]string {
 	values := map[string]string{
 		"datestr":        options.Timestamp,
 		"service":        options.Service,
@@ -501,6 +508,7 @@ func getStatsMetrics(result rpcshield.Result, options Options, err error) map[st
 		"csv_file_path":  result.CSVFilePath,
 		"html_file_path": result.HTMLFilePath,
 	}
+	maps.Copy(values, registryMetricValues(registryMeta))
 	if err != nil {
 		values["error"] = err.Error()
 	}
@@ -515,4 +523,32 @@ func getStatsMetrics(result rpcshield.Result, options Options, err error) map[st
 		}
 	}
 	return values
+}
+
+// registryMetricValues reports which service registry generation this run
+// used, where each of its components came from, and whether a fallback
+// occurred. A custom ServiceRegistryProvider (no meta) is reported as "custom".
+// This deliberately covers only service-registry provenance: keep-inbound
+// packages, production traffic records and tier overrides are independent
+// inputs and are never part of (or written back into) a registry generation.
+func registryMetricValues(meta serviceregistry.RegistryMeta) map[string]string {
+	generation := meta.Generation
+	if generation == "" {
+		generation = "custom"
+	}
+	componentSource := func(component string) string {
+		provenance, ok := meta.Components[component]
+		if !ok || provenance.Source == "" {
+			return "custom"
+		}
+		return provenance.Source
+	}
+	return map[string]string{
+		"registry_generation":            generation,
+		"registry_services_source":       componentSource(serviceregistry.ComponentServices),
+		"registry_network_groups_source": componentSource(serviceregistry.ComponentNetworkGroups),
+		"registry_fx_mappings_source":    componentSource(serviceregistry.ComponentFxMappings),
+		"registry_fallback":              strconv.FormatBool(meta.FellBack),
+		"registry_fallback_reason":       meta.FallbackReason,
+	}
 }
