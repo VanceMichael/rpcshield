@@ -18,13 +18,10 @@ import (
 // denoted by the entry binary package).
 // It returns the list of outbound points, the number of outbound calls that could not be associated with a service, and an error if any.
 func (f *Finder) Outbound(entryPkg *packages.Package, allPkgs []*packages.Package) ([]fty.OutboundPoint, map[fty.OutboundType]int, error) {
-	pkgMap := make(map[string]*packages.Package)
 	outboundMissingServiceCount := make(map[fty.OutboundType]int)
-	for _, pkg := range allPkgs {
-		if _, ok := pkgMap[pkg.PkgPath]; ok {
-			return nil, outboundMissingServiceCount, fmt.Errorf("duplicate package found: %q", pkg.PkgPath)
-		}
-		pkgMap[pkg.PkgPath] = pkg
+	allPkgs, pkgMap, err := fty.DedupPackages(f.logger, allPkgs)
+	if err != nil {
+		return nil, outboundMissingServiceCount, err
 	}
 
 	var outbounds []fty.OutboundPoint
