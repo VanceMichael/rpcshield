@@ -81,6 +81,9 @@ type Options struct {
 	NoOBClipByTier bool
 	// Analyzers is the list of analyzers (SSA, AST, LLM) to run for fail-ness detection.
 	Analyzers map[constant.AnalyzerKind]bool
+	// PersistentCachePath is the optional location of the Cache analyzer's persistent
+	// caller/callsite verdict cache. Empty keeps the default in-process-only behavior.
+	PersistentCachePath string
 	// GitSHA is the git SHA of the commit to be analyzed.
 	GitSHA string
 	// CSV is the flag to write the report to a CSV file.
@@ -390,6 +393,7 @@ func Run(options Options) (rpcshield.Result, error) {
 		KeepGoPathAfterRun:      options.KeepGoPathAfterRun,
 		BazelLoader:             options.BazelLoader,
 		Config:                  cfg,
+		PersistentCachePath:     options.PersistentCachePath,
 	}
 	if options.Difftime {
 		driverOpts.SGLinkRemoteHash = true

@@ -117,6 +117,7 @@ func main() {
 		cachedProdTrafficRecordsJSON := wpaFlags.String("use-cached-prod-traffic-records-json", "auto", "the path to the cached production service traffic records JSON file, `auto` or `refresh`")
 		cachedKeepIBPkgsJSON := wpaFlags.String("use-cached-keep-ib-pkgs-json", "auto", "the path to the allowlist of packages to keep")
 		analyzers := wpaFlags.String("analyzers", "SSA,AST", "comma-separated list of one or more analyzers (SSA, AST, LLM) to run for fail-ness detection or 'all' to run all analyzers")
+		persistentCachePath := wpaFlags.String("persistent-cache-path", "", "path to the persistent caller/callsite verdict cache used by the Cache analyzer; enables reuse of finished caller/callsite verdicts across processes (empty keeps the default in-process-only cache)")
 		gitSHA := wpaFlags.String("git-sha", "", "the git SHA of the commit being analyzed")
 		csv := wpaFlags.Bool("csv", true, "write the report to a CSV file")
 		html := wpaFlags.Bool("html", true, "write the report to an HTML file")
@@ -201,6 +202,7 @@ func main() {
 			PermutationThreshold:         *permutationThreshold,
 			TierOverrides:                tierOverrides,
 			Analyzers:                    analyzersMap,
+			PersistentCachePath:          *persistentCachePath,
 		}
 		if _, err := wpamode.Run(opts); err != nil {
 			log.Fatalf("Error running WPA: %v", err)

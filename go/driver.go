@@ -168,6 +168,18 @@ type DriverOptions struct {
 	// or already-loaded packages) and want to skip Bazel/GoPathWrapper entirely. See
 	// Driver.RunOnGoPath/Driver.RunOnPackages for the corresponding convenience entrypoints.
 	PackageSource func(target string) (pkgs []*packages.Package, ssaPkgs []*ssa.Package, ssaProg *ssa.Program, err error) `json:"-"`
+	// PersistentCachePath, when non-empty and the Cache analyzer is enabled
+	// (Analyzers[constant.CacheAnalyzerKind]), persists reusable caller/callsite verdicts to this
+	// file so that subsequent processes scanning the same code version can skip re-running the
+	// Predefined/SCCP/SSA/AST/LLM chain for identical (function, call site) pairs. The key folds
+	// in the stable function/call-site identity, analyzed-code version (GitSHA), tool/schema
+	// version, and every verdict-affecting analyzer option -- so source, call-location, analyzer
+	// order or option changes produce misses. Concurrent processes coordinate via a sibling lock
+	// file and merge through temp-file + atomic rename; corruption or an unwritable directory only
+	// degrades to the normal in-memory behavior (observable via the analyzer_cache_* metrics) and
+	// never changes a verdict. Empty (the default) preserves the existing purely in-process cache
+	// behavior, with no filesystem access from the cache layer.
+	PersistentCachePath string
 }
 
 // NewDriver returns a new Driver instance.
@@ -186,7 +198,51 @@ func NewDriver(workspaceRoot string, runner utils.Runner, gp bazel.GoPathWrapper
 		GoPathWrapper:             gp,
 		Logger:                    logger,
 		opts:                      opts,
-		cacheAnalyzer:             cacheanalyzer.NewCacheAnalyzer(),
+		cacheAnalyzer:             newDriverCacheAnalyzer(logger, opts),
+	}
+}
+
+// newDriverCacheAnalyzer builds the Cache analyzer for a driver run. Without
+// DriverOptions.PersistentCachePath it is the existing purely in-process cache; with a path it
+// additionally persists reusable verdicts keyed by stable function/call-site identity, analyzed
+// code version (GitSHA), tool/schema version, and the verdict-affecting analyzer configuration.
+func newDriverCacheAnalyzer(logger *zap.SugaredLogger, opts DriverOptions) cacheanalyzer.CacheAnalyzer {
+	cacheOpts := []cacheanalyzer.Option{cacheanalyzer.WithLogger(logger)}
+	// Persistence only takes effect when the Cache analyzer is part of the analyzer chain; a path
+	// configured without the Cache analyzer enabled must not touch the filesystem.
+	if opts.PersistentCachePath != "" && opts.Analyzers[constant.CacheAnalyzerKind] {
+		cacheOpts = append(cacheOpts,
+			cacheanalyzer.WithPersistentCache(opts.PersistentCachePath),
+			cacheanalyzer.WithCodeVersion(opts.GitSHA),
+			cacheanalyzer.WithVerdictConfig(buildVerdictConfig(opts)),
+		)
+	}
+	return cacheanalyzer.NewCacheAnalyzer(cacheOpts...)
+}
+
+// buildVerdictConfig collects the analyzer-chain inputs that can change an edge verdict and
+// therefore must be folded into the persistent cache key. Analyzers are listed in the fixed chain
+// order used by runAnalyzers (the Cache facade itself is intentionally excluded since it produces
+// no verdict); reordering the chain is a code change covered by the tool version, while enabling,
+// disabling or reordering listed analyzers via options changes the fingerprint.
+func buildVerdictConfig(opts DriverOptions) cacheanalyzer.VerdictConfig {
+	chainOrder := []constant.AnalyzerKind{
+		constant.Predefined,
+		constant.SCCP,
+		constant.SSA,
+		constant.AST,
+		constant.LLM,
+	}
+	enabled := make([]constant.AnalyzerKind, 0, len(chainOrder))
+	for _, kind := range chainOrder {
+		if opts.Analyzers[kind] {
+			enabled = append(enabled, kind)
+		}
+	}
+	return cacheanalyzer.VerdictConfig{
+		EnabledAnalyzers:           enabled,
+		NilOtherSourcesAfterSrc:    opts.NilOtherSourcesAfterSrc,
+		KnownErrorConstructorFuncs: append([]string(nil), opts.Config.KnownErrorConstructorFuncs...),
 	}
 }
 
@@ -213,6 +269,12 @@ const (
 	_sccpAnalysisDurationSecs          = "sccp_analysis_duration_secs"
 	_ssaAnalyzerDurationSecs           = "ssa_analyzer_duration_secs"
 	_astAnalyzerDurationSecs           = "ast_analyzer_duration_secs"
+	_analyzerCacheInprocHitCount       = "analyzer_cache_inproc_hit_count"
+	_analyzerCachePersistentHitCount   = "analyzer_cache_persistent_hit_count"
+	_analyzerCacheMissCount            = "analyzer_cache_miss_count"
+	_analyzerCacheInvalidRecordCount   = "analyzer_cache_invalid_record_count"
+	_analyzerCacheWriteDegradedCount   = "analyzer_cache_write_degraded_count"
+	_analyzerCacheLoadFailureCount     = "analyzer_cache_load_failure_count"
 )
 
 // Status represents the overall status of the rpcshield run.
@@ -330,6 +392,28 @@ func (d *Driver) Run(ctx context.Context, serviceName string) (result Result, er
 	runStart := time.Now()
 	d.analyzerDurations = make(map[string]float64)
 	d.sccpMetrics = &ssaanal.SCCPAggregateMetrics{}
+	// Snapshot cache counters at run start so the reported metrics describe only this run even
+	// when the Driver (and its cache analyzer) is shared across runs or Driver clones.
+	cacheMetricsStart := d.cacheAnalyzer.Metrics()
+	// Snapshot cache counters (as run-local deltas) after the flush below, so records persisted at
+	// run end and any final write degradations are reflected in the reported metrics.
+	defer func() {
+		cm := d.cacheAnalyzer.Metrics()
+		result.RunMetrics[_analyzerCacheInprocHitCount] = float64(max(cm.InProcessHits-cacheMetricsStart.InProcessHits, 0))
+		result.RunMetrics[_analyzerCachePersistentHitCount] = float64(max(cm.PersistentHits-cacheMetricsStart.PersistentHits, 0))
+		result.RunMetrics[_analyzerCacheMissCount] = float64(max(cm.Misses-cacheMetricsStart.Misses, 0))
+		result.RunMetrics[_analyzerCacheInvalidRecordCount] = float64(max(cm.InvalidRecords-cacheMetricsStart.InvalidRecords, 0))
+		result.RunMetrics[_analyzerCacheWriteDegradedCount] = float64(max(cm.WriteDegraded-cacheMetricsStart.WriteDegraded, 0))
+		result.RunMetrics[_analyzerCacheLoadFailureCount] = float64(max(cm.LoadFailures-cacheMetricsStart.LoadFailures, 0))
+	}()
+	// Flush any pending persistent verdicts before the metrics snapshot and result.json write
+	// above. Flush is strictly best-effort: its failure is already counted as a write degradation
+	// and must never change the run's status or verdicts.
+	defer func() {
+		if flushErr := d.cacheAnalyzer.Flush(); flushErr != nil {
+			d.Logger.Warnw("Failed to flush persistent analyzer cache", "error", flushErr)
+		}
+	}()
 	defer func() {
 		result.RunMetrics[_totalDurationSecs] = time.Now().Sub(runStart).Seconds()
 		// Log and capture max DRAM usage
@@ -1425,16 +1509,36 @@ func (d *Driver) runAnalyzers(caller *ssa.Function, callee *ast.CallExpr, callee
 	if d.opts.Analyzers[constant.CacheAnalyzerKind] {
 		source = constant.CacheAnalyzerKind
 		var originalInfo cacheanalyzer.OriginalFailnessInfo
-		originalInfo, err = d.cacheAnalyzer.AnalyzeCall(caller, calleeSite)
+		var hitKind cacheanalyzer.HitKind
+		originalInfo, hitKind, err = d.cacheAnalyzer.AnalyzeCall(caller, calleeSite)
 		if err == nil {
 			analyzerOutput = &output.AnalyzerOutput{Status: originalInfo.Status, Source: source, OriginalSource: originalInfo.Source}
+			d.Logger.Debugw("analyzer cache hit", "hit_kind", hitKind, "caller", caller.String(), "status", originalInfo.Status, "original_source", originalInfo.Source)
 			return
 		}
-		// if the cache analyzer does not find, add the result to the cache in the end, if there is no error.
+		// A cache miss is not an analyzer-chain error; reset so it is not mistaken for one when
+		// none of the downstream analyzers runs or overwrites `err`.
+		err = nil
+		// If the cache analyzer does not find it, run the chain below and commit only a verdict
+		// that is complete (no error/panic, non-nil output) and reusable across runs
+		// (cacheanalyzer.IsReusable): errors, panics, FailUnknownWithError, missing analyzer source
+		// or unfinished outputs must never become hits in a later run.
 		defer func() {
-			if err == nil {
-				d.cacheAnalyzer.InsertToCache(caller, calleeSite, analyzerOutput.Status, analyzerOutput.OriginalSource)
+			// A panic must bypass the cache commit entirely; re-throw it for the outer defer to
+			// convert into an error. Otherwise a half-computed output could become a future hit.
+			if r := recover(); r != nil {
+				panic(r)
 			}
+			if err != nil || analyzerOutput == nil {
+				return
+			}
+			status := analyzerOutput.Status
+			originalSource := analyzerOutput.OriginalSource
+			if !cacheanalyzer.IsReusable(status, originalSource) {
+				d.Logger.Debugw("not caching non-reusable analyzer conclusion", "caller", caller.String(), "status", status, "original_source", originalSource)
+				return
+			}
+			d.cacheAnalyzer.InsertToCache(caller, calleeSite, status, originalSource)
 		}()
 	}
 

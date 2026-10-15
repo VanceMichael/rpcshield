@@ -1,0 +1,2332 @@
+diff --git a/go/cmd/rpcshield/main.go b/go/cmd/rpcshield/main.go
+index 44a00bb..612a4bd 100644
+--- a/go/cmd/rpcshield/main.go
++++ b/go/cmd/rpcshield/main.go
+@@ -117,6 +117,7 @@ func main() {
+ 		cachedProdTrafficRecordsJSON := wpaFlags.String("use-cached-prod-traffic-records-json", "auto", "the path to the cached production service traffic records JSON file, `auto` or `refresh`")
+ 		cachedKeepIBPkgsJSON := wpaFlags.String("use-cached-keep-ib-pkgs-json", "auto", "the path to the allowlist of packages to keep")
+ 		analyzers := wpaFlags.String("analyzers", "SSA,AST", "comma-separated list of one or more analyzers (SSA, AST, LLM) to run for fail-ness detection or 'all' to run all analyzers")
++		persistentCachePath := wpaFlags.String("persistent-cache-path", "", "path to the persistent caller/callsite verdict cache used by the Cache analyzer; enables reuse of finished caller/callsite verdicts across processes (empty keeps the default in-process-only cache)")
+ 		gitSHA := wpaFlags.String("git-sha", "", "the git SHA of the commit being analyzed")
+ 		csv := wpaFlags.Bool("csv", true, "write the report to a CSV file")
+ 		html := wpaFlags.Bool("html", true, "write the report to an HTML file")
+@@ -201,6 +202,7 @@ func main() {
+ 			PermutationThreshold:         *permutationThreshold,
+ 			TierOverrides:                tierOverrides,
+ 			Analyzers:                    analyzersMap,
++			PersistentCachePath:          *persistentCachePath,
+ 		}
+ 		if _, err := wpamode.Run(opts); err != nil {
+ 			log.Fatalf("Error running WPA: %v", err)
+diff --git a/go/cmd/rpcshield/wpamode/wpa.go b/go/cmd/rpcshield/wpamode/wpa.go
+index a89e8c4..429466a 100644
+--- a/go/cmd/rpcshield/wpamode/wpa.go
++++ b/go/cmd/rpcshield/wpamode/wpa.go
+@@ -81,6 +81,9 @@ type Options struct {
+ 	NoOBClipByTier bool
+ 	// Analyzers is the list of analyzers (SSA, AST, LLM) to run for fail-ness detection.
+ 	Analyzers map[constant.AnalyzerKind]bool
++	// PersistentCachePath is the optional location of the Cache analyzer's persistent
++	// caller/callsite verdict cache. Empty keeps the default in-process-only behavior.
++	PersistentCachePath string
+ 	// GitSHA is the git SHA of the commit to be analyzed.
+ 	GitSHA string
+ 	// CSV is the flag to write the report to a CSV file.
+@@ -390,6 +393,7 @@ func Run(options Options) (rpcshield.Result, error) {
+ 		KeepGoPathAfterRun:      options.KeepGoPathAfterRun,
+ 		BazelLoader:             options.BazelLoader,
+ 		Config:                  cfg,
++		PersistentCachePath:     options.PersistentCachePath,
+ 	}
+ 	if options.Difftime {
+ 		driverOpts.SGLinkRemoteHash = true
+diff --git a/go/driver.go b/go/driver.go
+index f9702ed..3956326 100644
+--- a/go/driver.go
++++ b/go/driver.go
+@@ -168,6 +168,18 @@ type DriverOptions struct {
+ 	// or already-loaded packages) and want to skip Bazel/GoPathWrapper entirely. See
+ 	// Driver.RunOnGoPath/Driver.RunOnPackages for the corresponding convenience entrypoints.
+ 	PackageSource func(target string) (pkgs []*packages.Package, ssaPkgs []*ssa.Package, ssaProg *ssa.Program, err error) `json:"-"`
++	// PersistentCachePath, when non-empty and the Cache analyzer is enabled
++	// (Analyzers[constant.CacheAnalyzerKind]), persists reusable caller/callsite verdicts to this
++	// file so that subsequent processes scanning the same code version can skip re-running the
++	// Predefined/SCCP/SSA/AST/LLM chain for identical (function, call site) pairs. The key folds
++	// in the stable function/call-site identity, analyzed-code version (GitSHA), tool/schema
++	// version, and every verdict-affecting analyzer option -- so source, call-location, analyzer
++	// order or option changes produce misses. Concurrent processes coordinate via a sibling lock
++	// file and merge through temp-file + atomic rename; corruption or an unwritable directory only
++	// degrades to the normal in-memory behavior (observable via the analyzer_cache_* metrics) and
++	// never changes a verdict. Empty (the default) preserves the existing purely in-process cache
++	// behavior, with no filesystem access from the cache layer.
++	PersistentCachePath string
+ }
+ 
+ // NewDriver returns a new Driver instance.
+@@ -186,7 +198,51 @@ func NewDriver(workspaceRoot string, runner utils.Runner, gp bazel.GoPathWrapper
+ 		GoPathWrapper:             gp,
+ 		Logger:                    logger,
+ 		opts:                      opts,
+-		cacheAnalyzer:             cacheanalyzer.NewCacheAnalyzer(),
++		cacheAnalyzer:             newDriverCacheAnalyzer(logger, opts),
++	}
++}
++
++// newDriverCacheAnalyzer builds the Cache analyzer for a driver run. Without
++// DriverOptions.PersistentCachePath it is the existing purely in-process cache; with a path it
++// additionally persists reusable verdicts keyed by stable function/call-site identity, analyzed
++// code version (GitSHA), tool/schema version, and the verdict-affecting analyzer configuration.
++func newDriverCacheAnalyzer(logger *zap.SugaredLogger, opts DriverOptions) cacheanalyzer.CacheAnalyzer {
++	cacheOpts := []cacheanalyzer.Option{cacheanalyzer.WithLogger(logger)}
++	// Persistence only takes effect when the Cache analyzer is part of the analyzer chain; a path
++	// configured without the Cache analyzer enabled must not touch the filesystem.
++	if opts.PersistentCachePath != "" && opts.Analyzers[constant.CacheAnalyzerKind] {
++		cacheOpts = append(cacheOpts,
++			cacheanalyzer.WithPersistentCache(opts.PersistentCachePath),
++			cacheanalyzer.WithCodeVersion(opts.GitSHA),
++			cacheanalyzer.WithVerdictConfig(buildVerdictConfig(opts)),
++		)
++	}
++	return cacheanalyzer.NewCacheAnalyzer(cacheOpts...)
++}
++
++// buildVerdictConfig collects the analyzer-chain inputs that can change an edge verdict and
++// therefore must be folded into the persistent cache key. Analyzers are listed in the fixed chain
++// order used by runAnalyzers (the Cache facade itself is intentionally excluded since it produces
++// no verdict); reordering the chain is a code change covered by the tool version, while enabling,
++// disabling or reordering listed analyzers via options changes the fingerprint.
++func buildVerdictConfig(opts DriverOptions) cacheanalyzer.VerdictConfig {
++	chainOrder := []constant.AnalyzerKind{
++		constant.Predefined,
++		constant.SCCP,
++		constant.SSA,
++		constant.AST,
++		constant.LLM,
++	}
++	enabled := make([]constant.AnalyzerKind, 0, len(chainOrder))
++	for _, kind := range chainOrder {
++		if opts.Analyzers[kind] {
++			enabled = append(enabled, kind)
++		}
++	}
++	return cacheanalyzer.VerdictConfig{
++		EnabledAnalyzers:           enabled,
++		NilOtherSourcesAfterSrc:    opts.NilOtherSourcesAfterSrc,
++		KnownErrorConstructorFuncs: append([]string(nil), opts.Config.KnownErrorConstructorFuncs...),
+ 	}
+ }
+ 
+@@ -213,6 +269,12 @@ const (
+ 	_sccpAnalysisDurationSecs          = "sccp_analysis_duration_secs"
+ 	_ssaAnalyzerDurationSecs           = "ssa_analyzer_duration_secs"
+ 	_astAnalyzerDurationSecs           = "ast_analyzer_duration_secs"
++	_analyzerCacheInprocHitCount       = "analyzer_cache_inproc_hit_count"
++	_analyzerCachePersistentHitCount   = "analyzer_cache_persistent_hit_count"
++	_analyzerCacheMissCount            = "analyzer_cache_miss_count"
++	_analyzerCacheInvalidRecordCount   = "analyzer_cache_invalid_record_count"
++	_analyzerCacheWriteDegradedCount   = "analyzer_cache_write_degraded_count"
++	_analyzerCacheLoadFailureCount     = "analyzer_cache_load_failure_count"
+ )
+ 
+ // Status represents the overall status of the rpcshield run.
+@@ -330,6 +392,28 @@ func (d *Driver) Run(ctx context.Context, serviceName string) (result Result, er
+ 	runStart := time.Now()
+ 	d.analyzerDurations = make(map[string]float64)
+ 	d.sccpMetrics = &ssaanal.SCCPAggregateMetrics{}
++	// Snapshot cache counters at run start so the reported metrics describe only this run even
++	// when the Driver (and its cache analyzer) is shared across runs or Driver clones.
++	cacheMetricsStart := d.cacheAnalyzer.Metrics()
++	// Snapshot cache counters (as run-local deltas) after the flush below, so records persisted at
++	// run end and any final write degradations are reflected in the reported metrics.
++	defer func() {
++		cm := d.cacheAnalyzer.Metrics()
++		result.RunMetrics[_analyzerCacheInprocHitCount] = float64(max(cm.InProcessHits-cacheMetricsStart.InProcessHits, 0))
++		result.RunMetrics[_analyzerCachePersistentHitCount] = float64(max(cm.PersistentHits-cacheMetricsStart.PersistentHits, 0))
++		result.RunMetrics[_analyzerCacheMissCount] = float64(max(cm.Misses-cacheMetricsStart.Misses, 0))
++		result.RunMetrics[_analyzerCacheInvalidRecordCount] = float64(max(cm.InvalidRecords-cacheMetricsStart.InvalidRecords, 0))
++		result.RunMetrics[_analyzerCacheWriteDegradedCount] = float64(max(cm.WriteDegraded-cacheMetricsStart.WriteDegraded, 0))
++		result.RunMetrics[_analyzerCacheLoadFailureCount] = float64(max(cm.LoadFailures-cacheMetricsStart.LoadFailures, 0))
++	}()
++	// Flush any pending persistent verdicts before the metrics snapshot and result.json write
++	// above. Flush is strictly best-effort: its failure is already counted as a write degradation
++	// and must never change the run's status or verdicts.
++	defer func() {
++		if flushErr := d.cacheAnalyzer.Flush(); flushErr != nil {
++			d.Logger.Warnw("Failed to flush persistent analyzer cache", "error", flushErr)
++		}
++	}()
+ 	defer func() {
+ 		result.RunMetrics[_totalDurationSecs] = time.Now().Sub(runStart).Seconds()
+ 		// Log and capture max DRAM usage
+@@ -1425,16 +1509,36 @@ func (d *Driver) runAnalyzers(caller *ssa.Function, callee *ast.CallExpr, callee
+ 	if d.opts.Analyzers[constant.CacheAnalyzerKind] {
+ 		source = constant.CacheAnalyzerKind
+ 		var originalInfo cacheanalyzer.OriginalFailnessInfo
+-		originalInfo, err = d.cacheAnalyzer.AnalyzeCall(caller, calleeSite)
++		var hitKind cacheanalyzer.HitKind
++		originalInfo, hitKind, err = d.cacheAnalyzer.AnalyzeCall(caller, calleeSite)
+ 		if err == nil {
+ 			analyzerOutput = &output.AnalyzerOutput{Status: originalInfo.Status, Source: source, OriginalSource: originalInfo.Source}
++			d.Logger.Debugw("analyzer cache hit", "hit_kind", hitKind, "caller", caller.String(), "status", originalInfo.Status, "original_source", originalInfo.Source)
+ 			return
+ 		}
+-		// if the cache analyzer does not find, add the result to the cache in the end, if there is no error.
++		// A cache miss is not an analyzer-chain error; reset so it is not mistaken for one when
++		// none of the downstream analyzers runs or overwrites `err`.
++		err = nil
++		// If the cache analyzer does not find it, run the chain below and commit only a verdict
++		// that is complete (no error/panic, non-nil output) and reusable across runs
++		// (cacheanalyzer.IsReusable): errors, panics, FailUnknownWithError, missing analyzer source
++		// or unfinished outputs must never become hits in a later run.
+ 		defer func() {
+-			if err == nil {
+-				d.cacheAnalyzer.InsertToCache(caller, calleeSite, analyzerOutput.Status, analyzerOutput.OriginalSource)
++			// A panic must bypass the cache commit entirely; re-throw it for the outer defer to
++			// convert into an error. Otherwise a half-computed output could become a future hit.
++			if r := recover(); r != nil {
++				panic(r)
++			}
++			if err != nil || analyzerOutput == nil {
++				return
++			}
++			status := analyzerOutput.Status
++			originalSource := analyzerOutput.OriginalSource
++			if !cacheanalyzer.IsReusable(status, originalSource) {
++				d.Logger.Debugw("not caching non-reusable analyzer conclusion", "caller", caller.String(), "status", status, "original_source", originalSource)
++				return
+ 			}
++			d.cacheAnalyzer.InsertToCache(caller, calleeSite, status, originalSource)
+ 		}()
+ 	}
+ 
+diff --git a/go/driver_test.go b/go/driver_test.go
+index 0c27b6a..03c2505 100644
+--- a/go/driver_test.go
++++ b/go/driver_test.go
+@@ -1061,3 +1061,162 @@ func TestEnrichReportMetrics(t *testing.T) {
+ 	assert.Equal(t, 0, r2.Total.FailOpen)
+ 	assert.Equal(t, 0, r2.Total.FailUnknown)
+ }
++
++// edgeVerdictMultiset builds a comparable multiset of per-edge verdicts (caller, callee, status)
++// from AnalyzerMetrics, deliberately ignoring the producing source so cold (SCCP/SSA/AST) and warm
++// (Cache backed) runs can be compared verdict-by-verdict.
++func edgeVerdictMultiset(r Result) map[string]int {
++	m := make(map[string]int)
++	for _, row := range r.AnalyzerMetrics {
++		m[row["caller"]+"\x00"+row["callee"]+"\x00"+row["edge_result"]]++
++	}
++	return m
++}
++
++// cacheBackedEdgeCount counts edges served from the Cache analyzer (Source=Cache, OriginalSource
++// names the analyzer that first produced the verdict).
++func cacheBackedEdgeCount(r Result) int {
++	n := 0
++	for _, row := range r.AnalyzerMetrics {
++		if strings.HasPrefix(row["edge_result_source"], string(constant.CacheAnalyzerKind)) {
++			n++
++		}
++	}
++	return n
++}
++
++func persistentCacheTestDriver(t *testing.T, cachePath, gitSHA string, analyzers map[constant.AnalyzerKind]bool) (*Driver, grail.Service) {
++	t.Helper()
++	ctrl := gomock.NewController(t)
++	runner := utilsmock.NewMockRunner(ctrl)
++	runner.EXPECT().Run(gomock.Any()).DoAndReturn(func(cmd *exec.Cmd) error { return nil }).AnyTimes()
++	aiClient := genaimock.NewMockClient(ctrl)
++	lotteryService := grail.Service{Name: "lottery", Tier: 3}
++	clientTypeToService := servicemapping.ServiceMapping{}
++	clientTypeToService.AddMappings(
++		servicemapping.FullyQualifiedType{PkgPath: "thriftrw/lottery/lotteryclient", Name: "Interface"},
++		&servicemapping.ServiceWithIDLInfo{Service: lotteryService},
++	)
++	serviceMapper := servicemapping.New([]grail.Service{lotteryService}, clientTypeToService, nil /* logger */)
++
++	opts := _defaultDriverOptions
++	opts.OutputDir = t.TempDir()
++	opts.Timestamp = "2026-01-01T00:00:00Z"
++	opts.PersistentCachePath = cachePath
++	opts.GitSHA = gitSHA
++	if analyzers != nil {
++		opts.Analyzers = analyzers
++	}
++
++	driver := NewDriver(t.TempDir() /* workspace */, runner, nil /* GoPathWrapper */, serviceMapper, aiClient,
++		nil /* AllServices */, nil /* productionTrafficRecords */, nil /* logger */, opts)
++	curService := grail.Service{Name: "rpcshielddemo", Tier: 2}
++	return driver, curService
++}
++
++func runPersistentCacheDriver(t *testing.T, driver *Driver, curService grail.Service) Result {
++	t.Helper()
++	targets := []string{"//src/github.com/uber-research/rpcshield/go/exampleapps/rpcshielddemo:rpcshielddemo"}
++	result, err := driver.RunOnPackages(context.Background(), curService, targets, rpcshieldtest.LoadrpcshieldDemoPackages().All)
++	require.NoError(t, err)
++	require.Equal(t, Success, result.Status)
++	return result
++}
++
++// TestDriver_PersistentCache_CrossDriverReuse verifies a finished run persists reusable
++// caller/callsite verdicts, a second process-shaped run (fresh Driver, rebuilt SSA pointers, same
++// cache file) serves them from the persistent layer without changing any verdict, and that code
++// version or analyzer-configuration changes produce misses instead of stale hits.
++func TestDriver_PersistentCache_CrossDriverReuse(t *testing.T) {
++	t.Parallel()
++
++	cachePath := filepath.Join(t.TempDir(), "verdict-cache.json")
++
++	// Cold run: no cache file yet. Every cached lookup misses and the analyzer chain repopulates it.
++	coldDriver, curService := persistentCacheTestDriver(t, cachePath, "git-sha-1", nil)
++	cold := runPersistentCacheDriver(t, coldDriver, curService)
++	require.FileExists(t, cachePath)
++	require.Equal(t, float64(0), cold.RunMetrics[_analyzerCachePersistentHitCount])
++	require.Greater(t, cold.RunMetrics[_analyzerCacheMissCount], float64(0))
++	require.Equal(t, float64(0), cold.RunMetrics[_analyzerCacheLoadFailureCount])
++	require.Equal(t, float64(0), cold.RunMetrics[_analyzerCacheWriteDegradedCount])
++	coldEdges := edgeVerdictMultiset(cold)
++	require.NotEmpty(t, coldEdges)
++
++	// Warm run: independent Driver instance with a fresh SSA build reusing the same cache file.
++	warmDriver, _ := persistentCacheTestDriver(t, cachePath, "git-sha-1", nil)
++	warm := runPersistentCacheDriver(t, warmDriver, curService)
++	require.Greater(t, warm.RunMetrics[_analyzerCachePersistentHitCount], float64(0), "second process must reuse finished caller/callsite verdicts")
++	require.Equal(t, float64(0), warm.RunMetrics[_analyzerCacheLoadFailureCount])
++	require.Equal(t, float64(0), warm.RunMetrics[_analyzerCacheWriteDegradedCount])
++	require.Greater(t, cacheBackedEdgeCount(warm), 0, "warm edges must be attributed to the Cache analyzer with real OriginalSource")
++	// Every edge verdict (failness) is identical even though the chain was largely skipped.
++	require.Equal(t, coldEdges, edgeVerdictMultiset(warm))
++	require.Equal(t, cold.FailnessMetrics, warm.FailnessMetrics)
++
++	// Different analyzed code version -> no persistent hits, verdicts still computed by the chain.
++	newShaDriver, _ := persistentCacheTestDriver(t, cachePath, "git-sha-2", nil)
++	newSHA := runPersistentCacheDriver(t, newShaDriver, curService)
++	require.Equal(t, float64(0), newSHA.RunMetrics[_analyzerCachePersistentHitCount])
++	require.Greater(t, newSHA.RunMetrics[_analyzerCacheMissCount], float64(0))
++	require.Equal(t, coldEdges, edgeVerdictMultiset(newSHA))
++	require.Equal(t, cold.FailnessMetrics, newSHA.FailnessMetrics)
++
++	// Different verdict-affecting analyzer configuration (SCCP removed from the chain) -> miss.
++	analyzersNoSCCP := map[constant.AnalyzerKind]bool{
++		constant.CacheAnalyzerKind: true,
++		constant.Predefined:        true,
++		constant.SSA:               true,
++		constant.AST:               true,
++		constant.LLM:               true,
++	}
++	cfgDriver, _ := persistentCacheTestDriver(t, cachePath, "git-sha-1", analyzersNoSCCP)
++	cfgResult := runPersistentCacheDriver(t, cfgDriver, curService)
++	require.Equal(t, float64(0), cfgResult.RunMetrics[_analyzerCachePersistentHitCount])
++	require.Greater(t, cfgResult.RunMetrics[_analyzerCacheMissCount], float64(0))
++}
++
++// TestDriver_PersistentCache_CorruptionAndReadOnlyDegrade verifies cache problems never change
++// the analysis verdict: corruption is salvaged with a diagnostic and an unwritable cache
++// directory degrades writes, while the normal analyzer chain produces identical results.
++func TestDriver_PersistentCache_CorruptionAndReadOnlyDegrade(t *testing.T) {
++	t.Parallel()
++	if os.Geteuid() == 0 {
++		t.Skip("permission semantics do not apply when running as root")
++	}
++
++	cacheDir := t.TempDir()
++	cachePath := filepath.Join(cacheDir, "verdict-cache.json")
++
++	// Baseline run to capture verdicts without persistence issues.
++	baseDriver, curService := persistentCacheTestDriver(t, cachePath, "git-sha-x", nil)
++	base := runPersistentCacheDriver(t, baseDriver, curService)
++	baseEdges := edgeVerdictMultiset(base)
++	require.FileExists(t, cachePath)
++
++	// Corrupt the file mid-way: the next driver must observe a load failure diagnostic, fall back
++	// to the chain for every edge, salvage the file, and still return identical verdicts.
++	require.NoError(t, os.WriteFile(cachePath, []byte("{{corrupt"), 0o644))
++	corruptDriver, _ := persistentCacheTestDriver(t, cachePath, "git-sha-x", nil)
++	corrupt := runPersistentCacheDriver(t, corruptDriver, curService)
++	require.Greater(t, corrupt.RunMetrics[_analyzerCacheLoadFailureCount], float64(0))
++	require.Equal(t, float64(0), corrupt.RunMetrics[_analyzerCachePersistentHitCount])
++	require.Equal(t, baseEdges, edgeVerdictMultiset(corrupt))
++	require.Equal(t, base.FailnessMetrics, corrupt.FailnessMetrics)
++	// Salvage + repopulation makes the cache reusable by the next run.
++	recoverDriver, _ := persistentCacheTestDriver(t, cachePath, "git-sha-x", nil)
++	recovered := runPersistentCacheDriver(t, recoverDriver, curService)
++	require.Greater(t, recovered.RunMetrics[_analyzerCachePersistentHitCount], float64(0))
++	require.Equal(t, baseEdges, edgeVerdictMultiset(recovered))
++
++	// Read-only cache directory: reads/writes degrade observably without touching the verdict.
++	require.NoError(t, os.Chmod(cacheDir, 0o555))
++	t.Cleanup(func() { _ = os.Chmod(cacheDir, 0o755) })
++	roPath := filepath.Join(cacheDir, "readonly-cache.json")
++	roDriver, _ := persistentCacheTestDriver(t, roPath, "git-sha-y", nil)
++	ro := runPersistentCacheDriver(t, roDriver, curService)
++	require.Greater(t, ro.RunMetrics[_analyzerCacheWriteDegradedCount], float64(0))
++	require.Equal(t, float64(0), ro.RunMetrics[_analyzerCachePersistentHitCount])
++	require.Equal(t, baseEdges, edgeVerdictMultiset(ro))
++	require.Equal(t, base.FailnessMetrics, ro.FailnessMetrics)
++}
+diff --git a/go/staticanalyzer/cacheanalyzer/BUILD.bazel b/go/staticanalyzer/cacheanalyzer/BUILD.bazel
+index 992c063..2c8222f 100644
+--- a/go/staticanalyzer/cacheanalyzer/BUILD.bazel
++++ b/go/staticanalyzer/cacheanalyzer/BUILD.bazel
+@@ -3,22 +3,37 @@ load("@io_bazel_rules_go//go:def.bzl", "go_library", "go_test")
+ 
+ go_library(
+     name = "go_default_library",
+-    srcs = ["cacheanalyzer.go"],
++    srcs = [
++        "cacheanalyzer.go",
++        "identity.go",
++        "lock_unix.go",
++        "lock_windows.go",
++        "persistent.go",
++    ],
+     importpath = "github.com/uber-research/rpcshield/go/staticanalyzer/cacheanalyzer",
+     visibility = ["//visibility:public"],
+     deps = [
+         "//constant:go_default_library",
+         "@org_golang_x_tools//go/ssa:go_default_library",
++        "@org_uber_go_zap//:go_default_library",
+     ],
+ )
+ 
+ go_test(
+     name = "go_default_test",
+-    srcs = ["cacheanalyzer_test.go"],
++    srcs = [
++        "cacheanalyzer_test.go",
++        "persistent_test.go",
++    ],
+     embed = [":go_default_library"],
+     deps = [
+         "//constant:go_default_library",
++        "//loader:go_default_library",
++        "//rta/rtatest:go_default_library",
+         "@com_github_stretchr_testify//require:go_default_library",
++        "@org_golang_x_tools//go/packages:go_default_library",
+         "@org_golang_x_tools//go/ssa:go_default_library",
++        "@org_golang_x_tools//go/ssa/ssautil:go_default_library",
++        "@org_uber_go_zap//:go_default_library",
+     ],
+ )
+diff --git a/go/staticanalyzer/cacheanalyzer/cacheanalyzer.go b/go/staticanalyzer/cacheanalyzer/cacheanalyzer.go
+index e278d31..c289ff2 100644
+--- a/go/staticanalyzer/cacheanalyzer/cacheanalyzer.go
++++ b/go/staticanalyzer/cacheanalyzer/cacheanalyzer.go
+@@ -1,19 +1,41 @@
+ package cacheanalyzer
+ 
+ import (
++	"crypto/sha256"
++	"encoding/hex"
++	"encoding/json"
+ 	"fmt"
++	"go/ast"
++	"go/token"
++	"sort"
+ 	"sync"
++	"sync/atomic"
++	"time"
+ 
+ 	"github.com/uber-research/rpcshield/go/constant"
++	"go.uber.org/zap"
+ 	"golang.org/x/tools/go/ssa"
+ )
+ 
+ // CacheAnalyzer is an interface for analyzing and caching the failness of a function at an instruction.
+ type CacheAnalyzer interface {
+ 	// AnalyzeCall returns the failness of a function at an instruction if it is found in the cache.
+-	AnalyzeCall(f *ssa.Function, call ssa.Instruction) (OriginalFailnessInfo, error)
++	// The returned HitKind classifies where the verdict was served from (in-process memory or the
++	// persistent store), or HitMiss when neither layer has a reusable conclusion. A miss is not
++	// an analysis error: callers must fall through to the normal analyzer chain.
++	AnalyzeCall(f *ssa.Function, call ssa.Instruction) (OriginalFailnessInfo, HitKind, error)
+ 	// InsertToCache inserts the failness of a function at an instruction into the cache.
++	// Conclusions that are not reusable across runs (errors, panics, FailUnknownWithError, missing
++	// analyzer source, incomplete outputs) are rejected and counted as invalid records rather than
++	// stored -- see IsReusable.
+ 	InsertToCache(f *ssa.Function, call ssa.Instruction, failness constant.Failness, source constant.AnalyzerKind)
++	// Metrics returns a point-in-time snapshot of cache counters (hits by layer, misses,
++	// invalidated/rejected records, write degradations, and persistent-store load failures).
++	Metrics() Metrics
++	// Flush persists pending records to the configured persistent cache file. It is a no-op for
++	// an in-process-only analyzer. Flush never affects a verdict: all failures are reported via
++	// Metrics/Logs and as a non-fatal error return.
++	Flush() error
+ 	// One day when we need to delete from the cache, we can add this method.
+ }
+ 
+@@ -23,9 +45,126 @@ type OriginalFailnessInfo struct {
+ 	Source constant.AnalyzerKind
+ }
+ 
+-type cacheAnalyzer struct {
+-	*sync.RWMutex
+-	cache map[funcInsPair]OriginalFailnessInfo
++// HitKind classifies the result of an AnalyzeCall lookup.
++type HitKind string
++
++const (
++	// HitMiss means neither the in-process cache nor the persistent cache had a reusable verdict.
++	HitMiss HitKind = "miss"
++	// HitInProcess means the verdict was served from this process's in-memory cache.
++	HitInProcess HitKind = "in_process"
++	// HitPersistent means the verdict was loaded from the on-disk persistent cache.
++	HitPersistent HitKind = "persistent"
++)
++
++// Metrics holds observable counters for cache analyzer behavior.
++type Metrics struct {
++	// InProcessHits counts verdicts served from the in-memory cache.
++	InProcessHits int64
++	// PersistentHits counts verdicts served from the persistent on-disk cache.
++	PersistentHits int64
++	// Misses counts lookups served by neither cache layer.
++	Misses int64
++	// InvalidRecords counts records rejected as non-reusable: invalid/expired entries observed
++	// while loading or merging the persistent cache file, lookups that found a structurally bad
++	// record, and attempts to insert a conclusion that IsReusable rejects.
++	InvalidRecords int64
++	// WriteDegraded counts records that could not be persisted because the cache is write-degraded
++	// (unwritable directory, lock timeout on the final flush, unsupported newer schema, ...).
++	WriteDegraded int64
++	// LoadFailures counts persistent-cache (re)initialization failures (unreadable/corrupt file,
++	// unsupported schema/tool version). Each failing process initialization contributes at most a
++	// handful, so this is an integer counter rather than a boolean.
++	LoadFailures int64
++}
++
++// counters holds the live atomic counters shared by the in-memory and persistent layers.
++type counters struct {
++	inProcessHits  atomic.Int64
++	persistentHits atomic.Int64
++	misses         atomic.Int64
++	invalidRecords atomic.Int64
++	writeDegraded  atomic.Int64
++	loadFailures   atomic.Int64
++}
++
++func (c *counters) snapshot() Metrics {
++	return Metrics{
++		InProcessHits:  c.inProcessHits.Load(),
++		PersistentHits: c.persistentHits.Load(),
++		Misses:         c.misses.Load(),
++		InvalidRecords: c.invalidRecords.Load(),
++		WriteDegraded:  c.writeDegraded.Load(),
++		LoadFailures:   c.loadFailures.Load(),
++	}
++}
++
++// IsReusable reports whether a verdict may be cached and served back in a later analysis run.
++//
++// A conclusion is reusable only when:
++//   - its failness is one of the known statuses,
++//   - it is not FailUnknownWithError (a chain error that must be retried, not a verdict),
++//   - its OriginalSource identifies a real analyzer that completed (Predefined, SCCP, SSA, AST,
++//     LLM) -- neither Unknown nor the Cache facade itself.
++//
++// Plain FailUnknown IS reusable when a real analyzer produced it (it is a deliberate
++// "undetermined error value" verdict), but an unknown status with no analyzer source (an
++// unfinished/empty chain output) is not.
++func IsReusable(status constant.Failness, source constant.AnalyzerKind) bool {
++	if err := constant.ValidateFailness(status); err != nil {
++		return false
++	}
++	if status == constant.FailUnknownWithError {
++		return false
++	}
++	switch source {
++	case constant.Predefined, constant.SCCP, constant.SSA, constant.AST, constant.LLM:
++		return true
++	default:
++		return false
++	}
++}
++
++// VerdictConfig captures the analyzer-chain inputs that can change an edge verdict and therefore
++// must be part of the persistent cache key. Anything that only affects presentation (e.g. short
++// caller names, report formatting) or that happens outside runAnalyzers (e.g. annotations) must
++// NOT be added here.
++type VerdictConfig struct {
++	// EnabledAnalyzers is the ordered list of verdict-producing analyzers run by the chain
++	// (Predefined, SCCP, SSA, AST, LLM), in chain order. Enabling/disabling an analyzer or
++	// changing its position in the chain changes the fingerprint even if the set is identical.
++	EnabledAnalyzers []constant.AnalyzerKind
++	// NilOtherSourcesAfterSrc mirrors DriverOptions.NilOtherSourcesAfterSrc, an SCCP input.
++	NilOtherSourcesAfterSrc bool
++	// KnownErrorConstructorFuncs mirrors config.Config.KnownErrorConstructorFuncs, an SCCP input.
++	KnownErrorConstructorFuncs []string
++}
++
++// fingerprint returns a stable hex hash of the verdict-affecting configuration.
++func (c VerdictConfig) fingerprint() string {
++	funcs := make([]string, len(c.KnownErrorConstructorFuncs))
++	copy(funcs, c.KnownErrorConstructorFuncs)
++	sort.Strings(funcs)
++	enabled := make([]string, len(c.EnabledAnalyzers))
++	for i, a := range c.EnabledAnalyzers {
++		enabled[i] = string(a)
++	}
++	wire := struct {
++		EnabledAnalyzers           []string `json:"enabled_analyzers"`
++		NilOtherSourcesAfterSrc    bool     `json:"nil_other_sources_after_src"`
++		KnownErrorConstructorFuncs []string `json:"known_error_constructor_funcs"`
++	}{
++		EnabledAnalyzers:           enabled,
++		NilOtherSourcesAfterSrc:    c.NilOtherSourcesAfterSrc,
++		KnownErrorConstructorFuncs: funcs,
++	}
++	b, err := json.Marshal(wire)
++	if err != nil {
++		// All fields are trivially marshalable; a failure here would be a programming error.
++		panic(fmt.Sprintf("cacheanalyzer: marshal verdict config: %v", err))
++	}
++	sum := sha256.Sum256(b)
++	return hex.EncodeToString(sum[:])
+ }
+ 
+ type funcInsPair struct {
+@@ -33,29 +172,193 @@ type funcInsPair struct {
+ 	c ssa.Instruction
+ }
+ 
+-// NewCacheAnalyzer creates a new CacheAnalyzer.
+-func NewCacheAnalyzer() CacheAnalyzer {
+-	return &cacheAnalyzer{
+-		RWMutex: &sync.RWMutex{},
+-		cache:   make(map[funcInsPair]OriginalFailnessInfo),
++type cacheAnalyzer struct {
++	memMu sync.RWMutex
++	cache map[funcInsPair]OriginalFailnessInfo
++
++	ctr    *counters
++	logger *zap.SugaredLogger
++
++	persistent *persistentStore
++
++	// codeVersion is the analyzed-code version (e.g. Git SHA), folded into every persistent key.
++	codeVersion string
++	// configFingerprint is precomputed from VerdictConfig.
++	configFingerprint string
++
++	// srcCache caches file contents read for stable identities, by absolute filename.
++	srcMu     sync.Mutex
++	srcCache  map[string][]byte
++	// callEndCache maps a callsite's start position to its end position, lazily per SSA function,
++	// so the stable call text can be extracted without re-walking the AST on every edge.
++	endMu        sync.Mutex
++	callEndCache map[*ssa.Function]map[token.Pos]token.Pos
++}
++
++// Option configures a CacheAnalyzer.
++type Option func(*cacheAnalyzer)
++
++// WithLogger sets the logger used for persistent-cache diagnostics. Defaults to a no-op logger.
++func WithLogger(logger *zap.SugaredLogger) Option {
++	return func(c *cacheAnalyzer) {
++		if logger != nil {
++			c.logger = logger
++		}
+ 	}
+ }
+ 
++// WithPersistentCache enables the on-disk persistent cache at path. The file and its lock sibling
++// are created lazily; a missing file starts an empty cache, while an unreadable/corrupt file or an
++// unwritable directory only degrade this process to the normal in-memory behavior (see Metrics).
++func WithPersistentCache(path string) Option {
++	return func(c *cacheAnalyzer) {
++		if path == "" {
++			return
++		}
++		c.persistent = newPersistentStore(path, c.logger, c.ctr, func() time.Time { return time.Now().UTC() }, defaultFlushThreshold)
++	}
++}
++
++// WithCodeVersion sets the analyzed-code version (typically the Git SHA) folded into every
++// persistent key. Analyzing a different version yields cache misses even for identical sources.
++func WithCodeVersion(version string) Option {
++	return func(c *cacheAnalyzer) { c.codeVersion = version }
++}
++
++// WithVerdictConfig sets the verdict-affecting analyzer configuration fingerprint.
++func WithVerdictConfig(cfg VerdictConfig) Option {
++	return func(c *cacheAnalyzer) { c.configFingerprint = cfg.fingerprint() }
++}
++
++// withFlushThreshold overrides the number of pending records that triggers an intermediate flush.
++// Intended for tests.
++func withFlushThreshold(n int) Option {
++	return func(c *cacheAnalyzer) {
++		if c.persistent != nil && n > 0 {
++			c.persistent.flushThreshold = n
++		}
++	}
++}
++
++// NewCacheAnalyzer creates a new CacheAnalyzer. Without WithPersistentCache it keeps the existing
++// purely in-process behavior (no filesystem access whatsoever).
++func NewCacheAnalyzer(opts ...Option) CacheAnalyzer {
++	c := &cacheAnalyzer{
++		cache:        make(map[funcInsPair]OriginalFailnessInfo),
++		ctr:          &counters{},
++		logger:       zap.NewNop().Sugar(),
++		srcCache:     make(map[string][]byte),
++		callEndCache: make(map[*ssa.Function]map[token.Pos]token.Pos),
++	}
++	for _, opt := range opts {
++		opt(c)
++	}
++	return c
++}
++
+ // AnalyzeCall returns the failness of a function at an instruction if it is found in the cache.
+-func (c *cacheAnalyzer) AnalyzeCall(f *ssa.Function, call ssa.Instruction) (OriginalFailnessInfo, error) {
++func (c *cacheAnalyzer) AnalyzeCall(f *ssa.Function, call ssa.Instruction) (OriginalFailnessInfo, HitKind, error) {
+ 	key := funcInsPair{f: f, c: call}
+-	defer c.RUnlock()
+-	c.RLock()
+-	if failness, ok := c.cache[key]; ok {
+-		return failness, nil
++	c.memMu.RLock()
++	info, ok := c.cache[key]
++	c.memMu.RUnlock()
++	if ok {
++		c.ctr.inProcessHits.Add(1)
++		return info, HitInProcess, nil
+ 	}
+-	return OriginalFailnessInfo{Status: constant.FailUnknown, Source: constant.Unknown}, fmt.Errorf("failness not found in cache")
++
++	if c.persistent != nil {
++		rec, found, idErr := c.lookupPersistent(f, call)
++		switch {
++		case idErr != nil:
++			// A stable identity cannot be built for this edge (external function, no source,
++			// unreadable file). It can never be a persistent hit; degrade to miss but keep the
++			// in-memory layer usable for repeat occurrences within this process.
++			c.logger.Debugw("persistent cache lookup skipped: stable identity unavailable", "caller", safeFuncString(f), "error", idErr)
++		case found:
++			info := OriginalFailnessInfo{Status: constant.Failness(rec.Status), Source: constant.AnalyzerKind(rec.OriginalSource)}
++			// Re-validate defensively; a bad record must never become a verdict.
++			if IsReusable(info.Status, info.Source) {
++				c.memMu.Lock()
++				c.cache[key] = info
++				c.memMu.Unlock()
++				c.ctr.persistentHits.Add(1)
++				return info, HitPersistent, nil
++			}
++			c.logger.Warnw("persistent cache record failed validation on lookup; rejecting", "key", rec.Key, "status", rec.Status, "original_source", rec.OriginalSource)
++			c.ctr.invalidRecords.Add(1)
++		}
++	}
++
++	c.ctr.misses.Add(1)
++	return OriginalFailnessInfo{Status: constant.FailUnknown, Source: constant.Unknown}, HitMiss, fmt.Errorf("failness not found in cache")
+ }
+ 
+ // InsertToCache inserts the failness of a function at an instruction into the cache.
+ func (c *cacheAnalyzer) InsertToCache(f *ssa.Function, call ssa.Instruction, failness constant.Failness, source constant.AnalyzerKind) {
++	if !IsReusable(failness, source) {
++		c.ctr.invalidRecords.Add(1)
++		c.logger.Debugw("rejecting non-reusable analyzer conclusion", "caller", safeFuncString(f), "status", failness, "original_source", source)
++		return
++	}
++
+ 	key := funcInsPair{f: f, c: call}
+-	defer c.Unlock()
+-	c.Lock()
+-	c.cache[key] = OriginalFailnessInfo{Status: failness, Source: source}
++	info := OriginalFailnessInfo{Status: failness, Source: source}
++	c.memMu.Lock()
++	c.cache[key] = info
++	c.memMu.Unlock()
++
++	if c.persistent == nil {
++		return
++	}
++	rec, err := c.buildRecord(f, call, failness, source)
++	if err != nil {
++		c.ctr.invalidRecords.Add(1)
++		c.logger.Debugw("persistent cache record not built; verdict kept in process memory only", "caller", safeFuncString(f), "error", err)
++		return
++	}
++	c.persistent.add(rec)
++}
++
++// Metrics returns a snapshot of the cache counters.
++func (c *cacheAnalyzer) Metrics() Metrics { return c.ctr.snapshot() }
++
++// Flush flushes pending persistent records.
++func (c *cacheAnalyzer) Flush() error {
++	if c.persistent == nil {
++		return nil
++	}
++	if err := c.persistent.flush(); err != nil {
++		c.logger.Warnw("persistent verdict cache flush failed; analysis verdict unaffected", "path", c.persistent.path, "error", err)
++		return err
++	}
++	return nil
++}
++
++// astCallEnds returns a map from ast.CallExpr start positions to end positions within f's syntax.
++// It is best-effort: an empty map simply means call text is omitted from the identity.
++func (c *cacheAnalyzer) astCallEnds(f *ssa.Function) map[token.Pos]token.Pos {
++	c.endMu.Lock()
++	defer c.endMu.Unlock()
++	if m, ok := c.callEndCache[f]; ok {
++		return m
++	}
++	m := make(map[token.Pos]token.Pos)
++	if node := f.Syntax(); node != nil {
++		ast.Inspect(node, func(n ast.Node) bool {
++			if call, ok := n.(*ast.CallExpr); ok {
++				m[call.Pos()] = call.End()
++			}
++			return true
++		})
++	}
++	c.callEndCache[f] = m
++	return m
++}
++
++func safeFuncString(f *ssa.Function) string {
++	if f == nil {
++		return "<nil>"
++	}
++	return f.String()
+ }
+diff --git a/go/staticanalyzer/cacheanalyzer/cacheanalyzer_test.go b/go/staticanalyzer/cacheanalyzer/cacheanalyzer_test.go
+index 182bdac..cff5ee1 100644
+--- a/go/staticanalyzer/cacheanalyzer/cacheanalyzer_test.go
++++ b/go/staticanalyzer/cacheanalyzer/cacheanalyzer_test.go
+@@ -17,8 +17,9 @@ func TestAnalyzeCallNotFound(t *testing.T) {
+ 	dummyCall := &ssa.Call{}
+ 
+ 	// Since nothing is inserted, AnalyzeCall should return FailUnknown with an error.
+-	fail, err := ca.AnalyzeCall(dummyFunc, dummyCall)
++	fail, hitKind, err := ca.AnalyzeCall(dummyFunc, dummyCall)
+ 	require.Error(t, err)
++	require.Equal(t, HitMiss, hitKind)
+ 	require.Equal(t, constant.FailUnknown, fail.Status)
+ }
+ 
+@@ -36,8 +37,9 @@ func TestInsertAndAnalyzeCall(t *testing.T) {
+ 	ca.InsertToCache(dummyFunc, dummyCall, expectedFail, constant.SSA)
+ 
+ 	// Now AnalyzeCall should return the inserted failness without error.
+-	fail, err := ca.AnalyzeCall(dummyFunc, dummyCall)
++	fail, hitKind, err := ca.AnalyzeCall(dummyFunc, dummyCall)
+ 	require.NoError(t, err)
++	require.Equal(t, HitInProcess, hitKind)
+ 	require.Equal(t, expectedFail, fail.Status)
+ 	require.Equal(t, constant.SSA, fail.Source)
+ }
+diff --git a/go/staticanalyzer/cacheanalyzer/identity.go b/go/staticanalyzer/cacheanalyzer/identity.go
+new file mode 100644
+index 0000000..c1ff7e3
+--- /dev/null
++++ b/go/staticanalyzer/cacheanalyzer/identity.go
+@@ -0,0 +1,241 @@
++package cacheanalyzer
++
++import (
++	"crypto/sha256"
++	"encoding/hex"
++	"encoding/json"
++	"fmt"
++	"os"
++	"path/filepath"
++	"strings"
++
++	"github.com/uber-research/rpcshield/go/constant"
++	"golang.org/x/tools/go/ssa"
++)
++
++// stableIdentity is the cross-process stable identity of a (caller function, call site) pair.
++// Every field is derived from source-level information (import paths, names, source positions),
++// never from SSA pointers, so two processes rebuilding SSA from the same code compute the same
++// identity.
++type stableIdentity struct {
++	// PkgPath is the caller's import path, e.g. github.com/acme/svc/handler.
++	PkgPath string `json:"pkg_path"`
++	// Function is the SSA-style fully qualified function name (f.String()), including receiver
++	// type and funclit numbering, e.g. github.com/acme/svc/handler.(*H).Serve.func1.
++	Function string `json:"function"`
++	// CallSiteFile is the source file of the call site, normalized against the package import
++	// path so that lifted-GOPATH / bazel-sandbox prefixes do not change between processes.
++	CallSiteFile string `json:"callsite_file"`
++	// CallSiteLine and CallSiteColumn locate the call site within the file. Column is required to
++	// distinguish multiple calls on a single line.
++	CallSiteLine   int `json:"callsite_line"`
++	CallSiteColumn int `json:"callsite_column"`
++	// CallText is the raw source text of the call expression (best effort). Combined with line,
++	// column, signature and caller source hash it makes moved/retyped sites miss even if positions
++	// happen to collide.
++	CallText string `json:"call_text,omitempty"`
++	// CallSignature is the SSA signature of the call itself (its result tuple, e.g. (error)),
++	// capturing callee-signature changes that alter error propagation even when caller text is
++	// byte-identical.
++	CallSignature string `json:"call_signature,omitempty"`
++	// StaticCallee is f.String() of the static callee (if the call is statically dispatched).
++	// Dynamic/interface calls leave this empty.
++	StaticCallee string `json:"static_callee,omitempty"`
++}
++
++// stableID renders the identity as one stable, human-parseable string. It is also used to prune
++// records superseded by a new code/config fingerprint for the very same function+site.
++func (i stableIdentity) stableID() string {
++	return strings.Join([]string{
++		i.PkgPath,
++		i.Function,
++		fmt.Sprintf("%s:%d:%d", i.CallSiteFile, i.CallSiteLine, i.CallSiteColumn),
++		i.StaticCallee,
++		i.CallSignature,
++	}, "|")
++}
++
++// keyMaterial is the full set of inputs hashed into a persistent record key. A change in the
++// identity, analyzed code, tool/schema version, or verdict-affecting configuration changes the
++// hash and therefore produces a miss.
++type keyMaterial struct {
++	SchemaVersion     string         `json:"schema_version"`
++	ToolVersion       int            `json:"tool_version"`
++	Identity          stableIdentity `json:"identity"`
++	CodeFingerprint   string         `json:"code_fingerprint"`
++	ConfigFingerprint string         `json:"config_fingerprint"`
++}
++
++// buildIdentity derives the stable identity and the raw caller-function source bytes for an SSA
++// function and its call instruction.
++func (c *cacheAnalyzer) buildIdentity(f *ssa.Function, call ssa.Instruction) (stableIdentity, []byte, error) {
++	if f == nil || call == nil {
++		return stableIdentity{}, nil, fmt.Errorf("nil function or instruction")
++	}
++	if f.Prog == nil || f.Prog.Fset == nil {
++		return stableIdentity{}, nil, fmt.Errorf("function %q has no SSA program/file set", safeFuncString(f))
++	}
++	pkg := f.Pkg
++	if pkg == nil || pkg.Pkg == nil {
++		return stableIdentity{}, nil, fmt.Errorf("function %q has no package identity", safeFuncString(f))
++	}
++	node := f.Syntax()
++	if node == nil {
++		// External/native/synthetic functions have no source and are not analyzable inputs.
++		return stableIdentity{}, nil, fmt.Errorf("function %q has no source syntax", safeFuncString(f))
++	}
++
++	fset := f.Prog.Fset
++	callerStart := fset.Position(node.Pos())
++	callerEnd := fset.Position(node.End())
++	if callerStart.Filename == "" {
++		return stableIdentity{}, nil, fmt.Errorf("function %q has no source file position", safeFuncString(f))
++	}
++	src, err := c.readSource(callerStart.Filename)
++	if err != nil {
++		return stableIdentity{}, nil, fmt.Errorf("read caller source %q: %w", callerStart.Filename, err)
++	}
++	if callerStart.Offset < 0 || callerEnd.Offset > len(src) || callerEnd.Offset < callerStart.Offset {
++		return stableIdentity{}, nil, fmt.Errorf("caller source offsets out of range for %q", safeFuncString(f))
++	}
++	callerSource := src[callerStart.Offset:callerEnd.Offset]
++
++	sitePos := call.Pos()
++	if !sitePos.IsValid() {
++		return stableIdentity{}, nil, fmt.Errorf("call site in %q has no valid source position", safeFuncString(f))
++	}
++	site := fset.Position(sitePos)
++
++	id := stableIdentity{
++		PkgPath:        pkg.Pkg.Path(),
++		Function:       f.String(),
++		CallSiteFile:   normalizeFile(site.Filename, pkg.Pkg.Path()),
++		CallSiteLine:   site.Line,
++		CallSiteColumn: site.Column,
++	}
++	if ci, ok := call.(ssa.CallInstruction); ok && ci.Common() != nil {
++		if sig := ci.Common().Signature(); sig != nil {
++			id.CallSignature = sig.String()
++		}
++		if callee := ci.Common().StaticCallee(); callee != nil {
++			id.StaticCallee = callee.String()
++		}
++	}
++
++	// Best-effort raw text of the call expression. Failure here only loses the extra text guard;
++	// the caller-function source hash already covers every byte of the site anyway.
++	if end, ok := c.astCallEnds(f)[call.Pos()]; ok && site.Filename == callerStart.Filename {
++		endPos := fset.Position(end)
++		if endPos.Offset >= site.Offset && endPos.Offset <= len(src) {
++			id.CallText = string(src[site.Offset:endPos.Offset])
++		}
++	}
++
++	if id.CallSiteFile == "" || id.CallSiteLine == 0 {
++		return stableIdentity{}, nil, fmt.Errorf("call site in %q has no resolvable source location", safeFuncString(f))
++	}
++	return id, callerSource, nil
++}
++
++// buildRecord constructs a fully versioned stored record for a reusable conclusion.
++func (c *cacheAnalyzer) buildRecord(f *ssa.Function, call ssa.Instruction, status constant.Failness, source constant.AnalyzerKind) (storedRecord, error) {
++	id, callerSource, err := c.buildIdentity(f, call)
++	if err != nil {
++		return storedRecord{}, err
++	}
++	callerHash := sha256Hex(callerSource)
++	codeFP := codeFingerprint(c.codeVersion, callerHash)
++	km := keyMaterial{
++		SchemaVersion:     currentSchemaVersion,
++		ToolVersion:       currentToolVersion,
++		Identity:          id,
++		CodeFingerprint:   codeFP,
++		ConfigFingerprint: c.configFingerprint,
++	}
++	kb, err := json.Marshal(km)
++	if err != nil {
++		return storedRecord{}, fmt.Errorf("marshal cache key material: %w", err)
++	}
++	return storedRecord{
++		Key:               sha256Hex(kb),
++		SchemaVersion:     currentSchemaVersion,
++		ToolVersion:       currentToolVersion,
++		StableID:          id.stableID(),
++		Status:            string(status),
++		OriginalSource:    string(source),
++		CodeFingerprint:   codeFP,
++		ConfigFingerprint: c.configFingerprint,
++		CreatedAt:         c.persistent.now().Format(timestampLayout),
++	}, nil
++}
++
++// lookupPersistent finds a record by recomputing its full key. It returns (zero, false, nil) on a
++// miss and an error only when no stable identity could be built.
++func (c *cacheAnalyzer) lookupPersistent(f *ssa.Function, call ssa.Instruction) (storedRecord, bool, error) {
++	id, callerSource, err := c.buildIdentity(f, call)
++	if err != nil {
++		return storedRecord{}, false, err
++	}
++	km := keyMaterial{
++		SchemaVersion:     currentSchemaVersion,
++		ToolVersion:       currentToolVersion,
++		Identity:          id,
++		CodeFingerprint:   codeFingerprint(c.codeVersion, sha256Hex(callerSource)),
++		ConfigFingerprint: c.configFingerprint,
++	}
++	kb, err := json.Marshal(km)
++	if err != nil {
++		return storedRecord{}, false, fmt.Errorf("marshal cache key material: %w", err)
++	}
++	return c.persistent.lookup(sha256Hex(kb))
++}
++
++// readSource returns the contents of filename, caching per process.
++func (c *cacheAnalyzer) readSource(filename string) ([]byte, error) {
++	c.srcMu.Lock()
++	if src, ok := c.srcCache[filename]; ok {
++		c.srcMu.Unlock()
++		return src, nil
++	}
++	c.srcMu.Unlock()
++
++	src, err := os.ReadFile(filename)
++	if err != nil {
++		return nil, err
++	}
++	c.srcMu.Lock()
++	c.srcCache[filename] = src
++	c.srcMu.Unlock()
++	return src, nil
++}
++
++// normalizeFile turns an on-disk filename into a process-independent path by keeping the package
++// import path suffix (e.g. .../src/github.com/acme/svc/handler.go -> github.com/acme/svc/handler.go).
++// When the import path cannot be located, it falls back to the base filename so the cache degrades
++// to a miss across differing paths instead of yielding a wrong hit.
++func normalizeFile(filename, pkgPath string) string {
++	filename = filepath.ToSlash(filename)
++	if pkgPath != "" {
++		idx := strings.LastIndex(filename, pkgPath)
++		if idx >= 0 {
++			before := idx == 0 || filename[idx-1] == '/'
++			after := idx+len(pkgPath) == len(filename) || filename[idx+len(pkgPath)] == '/'
++			if before && after {
++				return filename[idx:]
++			}
++		}
++	}
++	return filepath.ToSlash(filepath.Base(filename))
++}
++
++// codeFingerprint combines the analyzed-code version (e.g. Git SHA) with the hash of the exact
++// caller-function source bytes. Either component changing produces a different fingerprint.
++func codeFingerprint(codeVersion, callerHash string) string {
++	sum := sha256.Sum256([]byte("code_version=" + codeVersion + "\ncaller_source=" + callerHash))
++	return sha256Hex(sum[:])
++}
++
++func sha256Hex(b []byte) string {
++	sum := sha256.Sum256(b)
++	return hex.EncodeToString(sum[:])
++}
+diff --git a/go/staticanalyzer/cacheanalyzer/lock_unix.go b/go/staticanalyzer/cacheanalyzer/lock_unix.go
+new file mode 100644
+index 0000000..536b76c
+--- /dev/null
++++ b/go/staticanalyzer/cacheanalyzer/lock_unix.go
+@@ -0,0 +1,28 @@
++//go:build !windows
++
++package cacheanalyzer
++
++import (
++	"os"
++	"syscall"
++)
++
++// tryLockFile non-blockingly takes an exclusive advisory flock. The kernel releases the lock
++// automatically when the process exits or the fd closes, so a crashed peer never wedges the cache.
++func tryLockFile(f *os.File) error {
++	return syscall.Flock(int(f.Fd()), syscall.LOCK_EX|syscall.LOCK_NB)
++}
++
++// unlockFile releases the advisory flock.
++func unlockFile(f *os.File) error {
++	return syscall.Flock(int(f.Fd()), syscall.LOCK_UN)
++}
++
++// syncDirBestEffort fsyncs the directory entry so a crash preserves the preceding rename. Errors
++// are intentionally ignored: the atomic rename itself is already durable-enough for cache reuse.
++func syncDirBestEffort(dir string) {
++	if d, err := os.Open(dir); err == nil {
++		_ = d.Sync()
++		_ = d.Close()
++	}
++}
+diff --git a/go/staticanalyzer/cacheanalyzer/lock_windows.go b/go/staticanalyzer/cacheanalyzer/lock_windows.go
+new file mode 100644
+index 0000000..81d0ac1
+--- /dev/null
++++ b/go/staticanalyzer/cacheanalyzer/lock_windows.go
+@@ -0,0 +1,15 @@
++//go:build windows
++
++package cacheanalyzer
++
++import (
++	"os"
++)
++
++// On platforms without flock, locking degrades to unlocked coordination (temp-file + atomic
++// rename still prevents torn reads). Multi-process write races merge-and-replace: a losing
++// rename is retried on the next flush with the winner's records merged in.
++
++func tryLockFile(f *os.File) error  { return nil }
++func unlockFile(f *os.File) error  { return nil }
++func syncDirBestEffort(dir string) {}
+diff --git a/go/staticanalyzer/cacheanalyzer/persistent.go b/go/staticanalyzer/cacheanalyzer/persistent.go
+new file mode 100644
+index 0000000..835738e
+--- /dev/null
++++ b/go/staticanalyzer/cacheanalyzer/persistent.go
+@@ -0,0 +1,484 @@
++package cacheanalyzer
++
++import (
++	"encoding/json"
++	"errors"
++	"fmt"
++	"io/fs"
++	"os"
++	"path/filepath"
++	"sync"
++	"time"
++
++	"github.com/uber-research/rpcshield/go/constant"
++	"go.uber.org/zap"
++)
++
++const (
++	// currentSchemaVersion is the on-disk record/file schema version. It must be bumped whenever
++	// the cache file layout or record semantics change incompatibly.
++	currentSchemaVersion = "v1"
++	// currentToolVersion invalidates every persisted verdict when analyzer behavior changes in a
++	// way the VerdictConfig fingerprint cannot capture (e.g. SCCP algorithm updates).
++	currentToolVersion = 1
++	// timestampLayout is the RFC3339 layout used in record timestamps.
++	timestampLayout = time.RFC3339Nano
++	// defaultFlushThreshold flushes pending records to disk once this many verdicts accumulated.
++	defaultFlushThreshold = 512
++	// lockTimeout bounds the time spent waiting on the cross-process cache lock.
++	lockTimeout = 10 * time.Second
++	// lockRetry is the interval between non-blocking lock attempts.
++	lockRetry = 50 * time.Millisecond
++)
++
++// storedRecord is one versioned, reusable verdict for a (function, call site) pair.
++type storedRecord struct {
++	// Key is the sha256 hex of keyMaterial (identity + code/config/tool/schema versions).
++	Key string `json:"key"`
++	// SchemaVersion is the schema this record was written under.
++	SchemaVersion string `json:"schema_version"`
++	// ToolVersion is the analyzer-tool record version this record was written under.
++	ToolVersion int `json:"tool_version"`
++	// StableID is the human-stable function+site identity, used for diagnostics and for pruning
++	// records superseded by a newer code/config version of the same function+site.
++	StableID string `json:"stable_id"`
++	// Status is the reusable failness verdict.
++	Status string `json:"status"`
++	// OriginalSource is the analyzer that actually produced the verdict (not the Cache facade).
++	OriginalSource string `json:"original_source"`
++	// CodeFingerprint hashes the analyzed-code version and the caller-function source bytes.
++	CodeFingerprint string `json:"code_fingerprint"`
++	// ConfigFingerprint hashes the verdict-affecting analyzer configuration.
++	ConfigFingerprint string `json:"config_fingerprint"`
++	// CreatedAt records when the verdict was first persisted (RFC3339Nano, UTC).
++	CreatedAt string `json:"created_at"`
++}
++
++// cacheFile is the on-disk cache document. Writes always go through temp-file + fsync + rename so
++// a reader never observes a partially written document.
++type cacheFile struct {
++	SchemaVersion string                  `json:"schema_version"`
++	ToolVersion   int                     `json:"tool_version"`
++	Records       map[string]storedRecord `json:"records"`
++}
++
++// persistentStore is the multi-process-safe on-disk verdict cache. Its zero-discipline rule:
++// any storage failure (corrupt file, unsupported schema, unwritable directory, lock timeout)
++// degrades this process to the normal analyzer chain with observable diagnostics; it can never
++// change an analysis verdict.
++type persistentStore struct {
++	path     string
++	dir      string
++	lockPath string
++	logger   *zap.SugaredLogger
++	now      func() time.Time
++
++	flushThreshold int
++
++	ctr *counters
++
++	mu             sync.RWMutex
++	records        map[string]storedRecord
++	pending        map[string]storedRecord
++	writesDisabled bool
++}
++
++func newPersistentStore(path string, logger *zap.SugaredLogger, ctr *counters, now func() time.Time, flushThreshold int) *persistentStore {
++	if logger == nil {
++		logger = zap.NewNop().Sugar()
++	}
++	if flushThreshold <= 0 {
++		flushThreshold = defaultFlushThreshold
++	}
++	s := &persistentStore{
++		path:           path,
++		dir:            filepath.Dir(path),
++		lockPath:       path + ".lock",
++		logger:         logger,
++		now:            now,
++		flushThreshold: flushThreshold,
++		ctr:            ctr,
++		records:        make(map[string]storedRecord),
++		pending:        make(map[string]storedRecord),
++	}
++	s.load()
++	return s
++}
++
++// load reads and validates the cache document. See the module-level design comments for the
++// corruption/version policy.
++func (s *persistentStore) load() {
++	data, err := os.ReadFile(s.path)
++	if err != nil {
++		if errors.Is(err, fs.ErrNotExist) {
++			return // empty cache, normal first run
++		}
++		// Unreadable (permissions, I/O error): do not attempt to overwrite, just disable the
++		// persistent layer for this run.
++		s.disable(fmt.Sprintf("persistent verdict cache unreadable at %q", s.path), err)
++		return
++	}
++
++	var cf cacheFile
++	if jerr := json.Unmarshal(data, &cf); jerr != nil {
++		s.salvageCorrupt(jerr)
++		return
++	}
++
++	switch {
++	case cf.SchemaVersion == "":
++		s.salvageCorrupt(fmt.Errorf("missing schema version in cache file %q", s.path))
++		return
++	case cf.SchemaVersion != currentSchemaVersion:
++		// A schema we do not understand. Never overwrite it; disable both reads and writes so a
++		// newer tool's records are preserved and remain authoritative.
++		s.disable(fmt.Sprintf("unsupported persistent cache schema version %q at %q (this tool uses %q)", cf.SchemaVersion, s.path, currentSchemaVersion), nil)
++		return
++	case cf.ToolVersion > currentToolVersion:
++		// Written by a newer tool: same preservation policy as an unknown schema.
++		s.disable(fmt.Sprintf("persistent cache at %q written by newer tool version %d (this tool uses %d)", s.path, cf.ToolVersion, currentToolVersion), nil)
++		return
++	case cf.ToolVersion < currentToolVersion:
++		// Older records can never match current-version keys (tool version is key material), so
++		// they are expired rather than corrupt. The layer stays enabled and repopulates.
++		s.ctr.invalidRecords.Add(int64(len(cf.Records)))
++		s.logger.Warnw("discarding persistent cache records written by an older tool version", "path", s.path, "file_tool_version", cf.ToolVersion, "current_tool_version", currentToolVersion, "discarded", len(cf.Records))
++		return
++	}
++
++	loaded := make(map[string]storedRecord, len(cf.Records))
++	rejected := 0
++	for key, rec := range cf.Records {
++		if !validStoredRecord(key, rec) {
++			rejected++
++			continue
++		}
++		loaded[key] = rec
++	}
++	s.mu.Lock()
++	s.records = loaded
++	s.mu.Unlock()
++	if rejected > 0 {
++		s.ctr.invalidRecords.Add(int64(rejected))
++		s.logger.Warnw("ignored invalid records while loading persistent verdict cache", "path", s.path, "rejected", rejected, "loaded", len(loaded))
++	}
++	s.logger.Infow("loaded persistent verdict cache", "path", s.path, "records", len(loaded))
++}
++
++// validStoredRecord validates one record before it can be served from disk or merged.
++func validStoredRecord(key string, rec storedRecord) bool {
++	if rec.Key == "" || rec.Key != key {
++		return false
++	}
++	if rec.SchemaVersion != currentSchemaVersion || rec.ToolVersion != currentToolVersion {
++		return false
++	}
++	if rec.StableID == "" || rec.CodeFingerprint == "" || rec.ConfigFingerprint == "" {
++		return false
++	}
++	return IsReusable(failnessOf(rec.Status), analyzerKindOf(rec.OriginalSource))
++}
++
++// salvageCorrupt moves an unreadable cache document aside (preserving its bytes for inspection)
++// and starts with an empty store, so the cache can be re-established immediately. The salvage is
++// coordinated through the cross-process lock and re-checks the file under it.
++func (s *persistentStore) salvageCorrupt(cause error) {
++	release, lockErr := s.acquireLock()
++	if lockErr != nil {
++		// Cannot coordinate: do not risk clobbering another process's recovery; stay disabled.
++		s.disable("persistent verdict cache is corrupt and the cache lock could not be acquired", errors.Join(cause, lockErr))
++		return
++	}
++	defer release()
++
++	// Another process may already have salvaged or replaced the file; re-check before renaming.
++	if data, err := os.ReadFile(s.path); err == nil {
++		var cf cacheFile
++		if json.Unmarshal(data, &cf) == nil && cf.SchemaVersion == currentSchemaVersion && cf.ToolVersion == currentToolVersion {
++			loaded := make(map[string]storedRecord, len(cf.Records))
++			for key, rec := range cf.Records {
++				if validStoredRecord(key, rec) {
++					loaded[key] = rec
++				}
++			}
++			s.mu.Lock()
++			s.records = loaded
++			s.mu.Unlock()
++			s.ctr.loadFailures.Add(1)
++			s.logger.Warnw("persistent verdict cache was recovered by another process; using it", "path", s.path, "records", len(loaded), "original_error", cause)
++			return
++		}
++		backup := fmt.Sprintf("%s.corrupt-%d", s.path, s.now().UnixNano())
++		if err := os.Rename(s.path, backup); err != nil {
++			s.disable("persistent verdict cache is corrupt and could not be moved aside", errors.Join(cause, err))
++			return
++		}
++		s.ctr.loadFailures.Add(1)
++		s.logger.Warnw("persistent verdict cache unreadable; moved corrupt file aside and starting with an empty cache", "path", s.path, "backup", backup, "error", cause)
++		return
++	} else if errors.Is(err, fs.ErrNotExist) {
++		// Another process already moved it aside; simply start fresh.
++		s.ctr.loadFailures.Add(1)
++		s.logger.Warnw("persistent verdict cache already recovered by another process; starting with an empty cache", "path", s.path, "error", cause)
++		return
++	} else {
++		s.disable("persistent verdict cache is corrupt and became unreadable", errors.Join(cause, err))
++		return
++	}
++}
++
++// disable marks the layer unusable for this process and records an observable load failure.
++func (s *persistentStore) disable(msg string, cause error) {
++	s.ctr.loadFailures.Add(1)
++	s.mu.Lock()
++	s.writesDisabled = true
++	s.mu.Unlock()
++	if cause != nil {
++		s.logger.Warnw(msg+"; falling back to in-process analyzer chain", "error", cause)
++	} else {
++		s.logger.Warnw(msg + "; falling back to in-process analyzer chain")
++	}
++}
++
++// lookup returns a validated record by full key hash.
++func (s *persistentStore) lookup(key string) (storedRecord, bool, error) {
++	s.mu.RLock()
++	defer s.mu.RUnlock()
++	if s.writesDisabled {
++		return storedRecord{}, false, nil
++	}
++	rec, ok := s.records[key]
++	return rec, ok, nil
++}
++
++// add queues a verdict for persistence. If the layer is write-degraded the record is counted as a
++// write degradation; it remains available in process memory regardless.
++func (s *persistentStore) add(rec storedRecord) {
++	s.mu.Lock()
++	if s.writesDisabled {
++		s.mu.Unlock()
++		s.ctr.writeDegraded.Add(1)
++		s.logger.Debugw("persistent cache write-degraded; verdict kept in process memory only", "key", rec.Key)
++		return
++	}
++	s.pending[rec.Key] = rec
++	n := len(s.pending)
++	threshold := s.flushThreshold
++	s.mu.Unlock()
++
++	if n >= threshold {
++		if err := s.flush(); err != nil {
++			s.logger.Debugw("intermediate persistent cache flush failed; will retry at run end", "error", err)
++		}
++	}
++}
++
++// flush merges this process's pending verdicts with the latest on-disk document under an exclusive
++// cross-process lock and atomically replaces the cache file. Valid on-disk records are never
++// dropped; records for the same function+site with a different (older) code/config fingerprint are
++// superseded. Errors never affect verdicts.
++func (s *persistentStore) flush() error {
++	s.mu.RLock()
++	if s.writesDisabled {
++		s.mu.RUnlock()
++		return nil
++	}
++	s.mu.RUnlock()
++
++	s.mu.Lock()
++	if len(s.pending) == 0 {
++		s.mu.Unlock()
++		return nil
++	}
++	pending := make(map[string]storedRecord, len(s.pending))
++	for k, v := range s.pending {
++		pending[k] = v
++	}
++	s.mu.Unlock()
++
++	release, err := s.acquireLock()
++	if err != nil {
++		if errors.Is(err, fs.ErrPermission) {
++			// Definitive (unwritable directory): stop trying for this process so later add()
++			// calls degrade immediately and every dropped record is counted.
++			s.giveUpWrites(pending, err)
++			return err
++		}
++		// Transient (lock busy, I/O hiccup): keep pending for the run-end retry without counting
++		// a degradation yet.
++		return fmt.Errorf("acquire cache lock: %w", err)
++	}
++	defer release()
++
++	merged, err := s.readLatestForMerge()
++	if err != nil {
++		// Fatal merge-read (future schema appeared, corruption un-salvageable, permission loss):
++		// stop trying to write this run.
++		s.giveUpWrites(pending, err)
++		return err
++	}
++
++	// Index on-disk records by stable function+site identity so we can supersede older versions
++	// of the exact same site while leaving every unrelated verdict untouched.
++	pendingStableIDs := make(map[string]bool, len(pending))
++	for _, rec := range pending {
++		pendingStableIDs[rec.StableID] = true
++	}
++	supersededKeys := make(map[string]bool)
++	for key, rec := range merged {
++		if pendingStableIDs[rec.StableID] {
++			if _, keep := pending[key]; !keep {
++				delete(merged, key)
++				supersededKeys[key] = true
++			}
++		}
++	}
++	for key, rec := range pending {
++		merged[key] = rec
++	}
++
++	if err := s.writeAtomically(merged); err != nil {
++		s.giveUpWrites(pending, err)
++		return err
++	}
++
++	s.mu.Lock()
++	for key := range supersededKeys {
++		delete(s.records, key)
++	}
++	for key, rec := range pending {
++		s.records[key] = rec
++		delete(s.pending, key)
++	}
++	s.mu.Unlock()
++
++	s.logger.Debugw("flushed persistent verdict cache", "path", s.path, "new_records", len(pending), "superseded", len(supersededKeys), "total_records", len(merged))
++	return nil
++}
++
++// readLatestForMerge re-reads and validates the on-disk document while holding the lock. It
++// returns a writable map even when the file does not exist yet.
++func (s *persistentStore) readLatestForMerge() (map[string]storedRecord, error) {
++	data, err := os.ReadFile(s.path)
++	if err != nil {
++		if errors.Is(err, fs.ErrNotExist) {
++			return make(map[string]storedRecord), nil
++		}
++		return nil, fmt.Errorf("read cache file: %w", err)
++	}
++	var cf cacheFile
++	if err := json.Unmarshal(data, &cf); err != nil {
++		// A concurrent writer using temp+rename cannot produce this; treat external corruption by
++		// moving it aside, preserving the bytes.
++		backup := fmt.Sprintf("%s.corrupt-%d", s.path, s.now().UnixNano())
++		if renameErr := os.Rename(s.path, backup); renameErr != nil {
++			return nil, fmt.Errorf("cache corrupt and backup failed: %w", errors.Join(err, renameErr))
++		}
++		s.ctr.loadFailures.Add(1)
++		s.logger.Warnw("persistent verdict cache found corrupt during merge; moved aside", "path", s.path, "backup", backup, "error", err)
++		return make(map[string]storedRecord), nil
++	}
++	if cf.SchemaVersion != currentSchemaVersion || cf.ToolVersion != currentToolVersion {
++		// A newer/unknown document showed up (e.g. a newer tool ran concurrently). Never clobber.
++		return nil, fmt.Errorf("cache file version unsupported during merge: schema=%q tool=%d", cf.SchemaVersion, cf.ToolVersion)
++	}
++	merged := make(map[string]storedRecord, len(cf.Records))
++	rejected := 0
++	for key, rec := range cf.Records {
++		if !validStoredRecord(key, rec) {
++			rejected++
++			continue
++		}
++		merged[key] = rec
++	}
++	if rejected > 0 {
++		s.ctr.invalidRecords.Add(int64(rejected))
++		s.logger.Warnw("ignored invalid records while merging persistent verdict cache", "path", s.path, "rejected", rejected)
++	}
++	return merged, nil
++}
++
++// writeAtomically writes the document to a temp file in the destination directory, fsyncs it, and
++// renames it over the cache file. The directory is fsynced best-effort so the rename survives a
++// crash.
++func (s *persistentStore) writeAtomically(records map[string]storedRecord) error {
++	if err := os.MkdirAll(s.dir, 0o755); err != nil {
++		return fmt.Errorf("create cache directory: %w", err)
++	}
++	doc := cacheFile{
++		SchemaVersion: currentSchemaVersion,
++		ToolVersion:   currentToolVersion,
++		Records:       records,
++	}
++	tmp, err := os.CreateTemp(s.dir, "."+filepath.Base(s.path)+".tmp-*")
++	if err != nil {
++		return fmt.Errorf("create temp cache file: %w", err)
++	}
++	tmpName := tmp.Name()
++	enc := json.NewEncoder(tmp)
++	enc.SetIndent("", "  ")
++	if err := enc.Encode(doc); err != nil {
++		tmp.Close()
++		os.Remove(tmpName)
++		return fmt.Errorf("encode cache file: %w", err)
++	}
++	if err := tmp.Sync(); err != nil {
++		tmp.Close()
++		os.Remove(tmpName)
++		return fmt.Errorf("fsync temp cache file: %w", err)
++	}
++	if err := tmp.Close(); err != nil {
++		os.Remove(tmpName)
++		return fmt.Errorf("close temp cache file: %w", err)
++	}
++	if err := os.Rename(tmpName, s.path); err != nil {
++		os.Remove(tmpName)
++		return fmt.Errorf("replace cache file: %w", err)
++	}
++	syncDirBestEffort(s.dir)
++	return nil
++}
++
++// giveUpWrites marks the layer write-degraded and accounts for the dropped pending records.
++// Reads of already-loaded records remain allowed; subsequent add() calls are counted degraded.
++func (s *persistentStore) giveUpWrites(dropped map[string]storedRecord, cause error) {
++	s.ctr.writeDegraded.Add(int64(len(dropped)))
++	s.mu.Lock()
++	for key := range dropped {
++		delete(s.pending, key)
++	}
++	// Keep the layer readable but stop attempting writes for this process.
++	s.writesDisabled = true
++	s.mu.Unlock()
++	s.logger.Warnw("persistent verdict cache writes disabled for this process; verdicts unaffected", "path", s.path, "dropped_records", len(dropped), "error", cause)
++}
++
++// acquireLock takes an exclusive, process-advisory lock on the sibling lock file. It is
++// non-blocking with bounded retries so a dead/locked peer degrades to the analyzer chain instead
++// of hanging the analysis.
++func (s *persistentStore) acquireLock() (func(), error) {
++	if err := os.MkdirAll(s.dir, 0o755); err != nil {
++		return nil, fmt.Errorf("create cache directory: %w", err)
++	}
++	f, err := os.OpenFile(s.lockPath, os.O_CREATE|os.O_RDWR, 0o644)
++	if err != nil {
++		return nil, fmt.Errorf("open cache lock file: %w", err)
++	}
++	deadline := s.now().Add(lockTimeout)
++	for {
++		if err := tryLockFile(f); err == nil {
++			return func() {
++				_ = unlockFile(f)
++				_ = f.Close()
++			}, nil
++		} else if !s.now().Before(deadline) {
++			_ = f.Close()
++			return nil, fmt.Errorf("timed out waiting for cache lock %q: %w", s.lockPath, err)
++		}
++		time.Sleep(lockRetry)
++	}
++}
++
++// failnessOf/analyzerKindOf are thin string conversions used by record validation.
++func failnessOf(s string) constant.Failness         { return constant.Failness(s) }
++func analyzerKindOf(s string) constant.AnalyzerKind { return constant.AnalyzerKind(s) }
+diff --git a/go/staticanalyzer/cacheanalyzer/persistent_test.go b/go/staticanalyzer/cacheanalyzer/persistent_test.go
+new file mode 100644
+index 0000000..45f6276
+--- /dev/null
++++ b/go/staticanalyzer/cacheanalyzer/persistent_test.go
+@@ -0,0 +1,711 @@
++package cacheanalyzer
++
++import (
++	"encoding/json"
++	"fmt"
++	"os"
++	"os/exec"
++	"path/filepath"
++	"runtime"
++	"strings"
++	"sync"
++	"testing"
++	"time"
++
++	"github.com/stretchr/testify/require"
++	"github.com/uber-research/rpcshield/go/constant"
++	"github.com/uber-research/rpcshield/go/loader"
++	"github.com/uber-research/rpcshield/go/rta/rtatest"
++	"go.uber.org/zap"
++	"golang.org/x/tools/go/ssa"
++	"golang.org/x/tools/go/ssa/ssautil"
++)
++
++// TestMain arranges for a real Go SDK under bazel test (no-op under plain `go test`).
++func TestMain(m *testing.M) {
++	rtatest.RunWithGoSDK(m)
++}
++
++const _fixturePkg = "fixturepkg"
++
++// fixtureSrc variants: the function body is kept minimal so positions are easy to reason about.
++const fixtureSrcV1 = `package fixturepkg
++
++func anRPCCall() error { return nil }
++
++func analyzeCaller() error {
++	if err := anRPCCall(); err != nil {
++		return err
++	}
++	return nil
++}
++`
++
++// Same body plus a no-op line before the call: the call site moves down a line, identity changes.
++const fixtureSrcMovedSite = `package fixturepkg
++
++func anRPCCall() error { return nil }
++
++func analyzeCaller() error {
++	_ = 0
++	if err := anRPCCall(); err != nil {
++		return err
++	}
++	return nil
++}
++`
++
++// Changed function body while keeping the call at the exact same line/column: only statements
++// after the call are added, so StableID is identical but the caller-source hash changes.
++const fixtureSrcChangedBody = `package fixturepkg
++
++func anRPCCall() error { return nil }
++
++func analyzeCaller() error {
++	if err := anRPCCall(); err != nil {
++		return err
++	}
++	x := 0
++	_ = x
++	return nil
++}
++`
++
++// ssaPair is a loaded function/call-instruction pair.
++type ssaPair struct {
++	prog *ssa.Program
++	fn   *ssa.Function
++	call ssa.CallInstruction
++}
++
++// writeFixture lays out a GOPATH-shaped tree with the given source and loads SSA from it.
++func writeFixture(t *testing.T, src string) string {
++	t.Helper()
++	gopath := t.TempDir()
++	pkgDir := filepath.Join(gopath, "src", _fixturePkg)
++	require.NoError(t, os.MkdirAll(pkgDir, 0o755))
++	require.NoError(t, os.WriteFile(filepath.Join(pkgDir, "a.go"), []byte(src), 0o644))
++	return gopath
++}
++
++func loadSSAPair(t *testing.T, gopath string) ssaPair {
++	t.Helper()
++	pkgs, err := loader.LoadAll(gopath, nil)
++	require.NoError(t, err)
++	require.NotEmpty(t, pkgs)
++	for _, p := range pkgs {
++		require.Emptyf(t, p.Errors, "package %s errors: %v", p.PkgPath, p.Errors)
++	}
++	prog, ssaPkgs := ssautil.AllPackages(pkgs, ssa.InstantiateGenerics|ssa.GlobalDebug)
++	prog.Build()
++
++	var found ssaPair
++	for _, sp := range ssaPkgs {
++		if sp == nil || sp.Pkg == nil || sp.Pkg.Path() != _fixturePkg {
++			continue
++		}
++		fn := sp.Func("analyzeCaller")
++		require.NotNil(t, fn, "analyzeCaller not found")
++		for _, b := range fn.Blocks {
++			for _, instr := range b.Instrs {
++				if call, ok := instr.(*ssa.Call); ok && strings.Contains(call.Common().Value.String(), "anRPCCall") {
++					found = ssaPair{prog: prog, fn: fn, call: call}
++					return found
++				}
++			}
++		}
++	}
++	t.Fatal("anRPCCall call instruction not found")
++	return found
++}
++
++func testVerdictConfig() VerdictConfig {
++	return VerdictConfig{
++		EnabledAnalyzers: []constant.AnalyzerKind{constant.Predefined, constant.SCCP, constant.SSA, constant.AST},
++	}
++}
++
++func newPersistentTestAnalyzer(t *testing.T, cachePath, codeVersion string, cfg VerdictConfig) CacheAnalyzer {
++	if t != nil {
++		t.Helper()
++	}
++	return NewCacheAnalyzer(
++		WithLogger(zap.NewNop().Sugar()),
++		WithPersistentCache(cachePath),
++		WithCodeVersion(codeVersion),
++		WithVerdictConfig(cfg),
++	)
++}
++
++// --- In-process behavior unchanged when no persistent path is configured ---------------------
++
++func TestNewCacheAnalyzer_NoPersistenceTouchesNoFiles(t *testing.T) {
++	t.Parallel()
++	ca := NewCacheAnalyzer()
++	p := loadSSAPair(t, writeFixture(t, fixtureSrcV1))
++	_, hit, err := ca.AnalyzeCall(p.fn, p.call)
++	require.Error(t, err)
++	require.Equal(t, HitMiss, hit)
++	m := ca.Metrics()
++	require.Equal(t, int64(1), m.Misses)
++	require.Zero(t, m.PersistentHits)
++	require.NoError(t, ca.Flush())
++}
++
++// --- Cross-process reuse ---------------------------------------------------------------------
++
++func TestPersistentCache_CrossInstanceReuse(t *testing.T) {
++	t.Parallel()
++	cachePath := filepath.Join(t.TempDir(), "verdicts.json")
++	cfg := testVerdictConfig()
++
++	gopath1 := writeFixture(t, fixtureSrcV1)
++	p1 := loadSSAPair(t, gopath1)
++	ca1 := newPersistentTestAnalyzer(t, cachePath, "sha-a", cfg)
++
++	info, hit, err := ca1.AnalyzeCall(p1.fn, p1.call)
++	require.Error(t, err)
++	require.Equal(t, HitMiss, hit)
++	require.Equal(t, constant.FailUnknown, info.Status)
++
++	ca1.InsertToCache(p1.fn, p1.call, constant.FailClose, constant.SCCP)
++	// The in-memory layer serves the repeat immediately.
++	info, hit, err = ca1.AnalyzeCall(p1.fn, p1.call)
++	require.NoError(t, err)
++	require.Equal(t, HitInProcess, hit)
++	require.Equal(t, constant.FailClose, info.Status)
++	require.Equal(t, constant.SCCP, info.Source)
++	require.NoError(t, ca1.Flush())
++	require.FileExists(t, cachePath)
++
++	// A second "process": fresh SSA rebuild (new pointers), fresh analyzer, same cache file,
++	// same code version and analyzer configuration.
++	p2 := loadSSAPair(t, writeFixture(t, fixtureSrcV1))
++	ca2 := newPersistentTestAnalyzer(t, cachePath, "sha-a", cfg)
++	info, hit, err = ca2.AnalyzeCall(p2.fn, p2.call)
++	require.NoError(t, err)
++	require.Equal(t, HitPersistent, hit)
++	require.Equal(t, constant.FailClose, info.Status)
++	require.Equal(t, constant.SCCP, info.Source)
++	m := ca2.Metrics()
++	require.Equal(t, int64(1), m.PersistentHits)
++	require.Zero(t, m.LoadFailures)
++
++	// After a persistent hit the in-memory layer takes over for repeats in this process.
++	_, hit, _ = ca2.AnalyzeCall(p2.fn, p2.call)
++	require.Equal(t, HitInProcess, hit)
++}
++
++// Real separate OS processes exercising the same cache file.
++func TestPersistentCache_SubprocessReuse(t *testing.T) {
++	if mode := os.Getenv("RPCSHIELD_CACHE_CHILD_MODE"); mode != "" {
++		runCacheChild(t, mode)
++		return
++	}
++	t.Parallel()
++
++	cachePath := filepath.Join(t.TempDir(), "verdicts.json")
++	gopath := writeFixture(t, fixtureSrcV1)
++
++	writer := exec.Command(os.Args[0], "-test.run=^TestPersistentCache_SubprocessReuse$", "-test.v")
++	writer.Env = append(os.Environ(),
++		"RPCSHIELD_CACHE_CHILD_MODE=write",
++		"RPCSHIELD_CACHE_PATH="+cachePath,
++		"RPCSHIELD_CACHE_GOPATH="+gopath,
++	)
++	writeOut, err := writer.CombinedOutput()
++	require.NoError(t, err, "writer child failed: %s", writeOut)
++	require.Contains(t, string(writeOut), "CACHE_CHILD_WRITE_DONE")
++	require.FileExists(t, cachePath)
++
++	reader := exec.Command(os.Args[0], "-test.run=^TestPersistentCache_SubprocessReuse$", "-test.v")
++	reader.Env = append(os.Environ(),
++		"RPCSHIELD_CACHE_CHILD_MODE=read",
++		"RPCSHIELD_CACHE_PATH="+cachePath,
++		"RPCSHIELD_CACHE_GOPATH="+gopath,
++	)
++	readOut, err := reader.CombinedOutput()
++	require.NoError(t, err, "reader child failed: %s", readOut)
++	require.Contains(t, string(readOut), "CACHE_CHILD_HIT FailClose SCCP", "reader output: %s", readOut)
++}
++
++func runCacheChild(t *testing.T, mode string) {
++	cachePath := os.Getenv("RPCSHIELD_CACHE_PATH")
++	gopath := os.Getenv("RPCSHIELD_CACHE_GOPATH")
++	p := loadSSAPair(t, gopath)
++	ca := newPersistentTestAnalyzer(nil, cachePath, "sha-child", testVerdictConfig())
++	switch mode {
++	case "write":
++		if _, _, err := ca.AnalyzeCall(p.fn, p.call); err == nil {
++			fmt.Println("CACHE_CHILD_UNEXPECTED_HIT")
++			os.Exit(1)
++		}
++		ca.InsertToCache(p.fn, p.call, constant.FailClose, constant.SCCP)
++		if err := ca.Flush(); err != nil {
++			fmt.Println("CACHE_CHILD_FLUSH_ERROR", err)
++			os.Exit(1)
++		}
++		fmt.Println("CACHE_CHILD_WRITE_DONE")
++	case "read":
++		info, hit, err := ca.AnalyzeCall(p.fn, p.call)
++		if err != nil || hit != HitPersistent {
++			fmt.Printf("CACHE_CHILD_MISS hit=%s err=%v\n", hit, err)
++			os.Exit(1)
++		}
++		fmt.Printf("CACHE_CHILD_HIT %s %s\n", info.Status, info.Source)
++	default:
++		os.Exit(2)
++	}
++}
++
++// --- Invalidation: source / call location / config / code version ----------------------------
++
++func TestPersistentCache_SourceAndLocationInvalidation(t *testing.T) {
++	t.Parallel()
++	cachePath := filepath.Join(t.TempDir(), "verdicts.json")
++	cfg := testVerdictConfig()
++
++	p1 := loadSSAPair(t, writeFixture(t, fixtureSrcV1))
++	ca1 := newPersistentTestAnalyzer(t, cachePath, "sha-a", cfg)
++	ca1.InsertToCache(p1.fn, p1.call, constant.FailClose, constant.SCCP)
++	require.NoError(t, ca1.Flush())
++	require.Len(t, readCacheDoc(t, cachePath).Records, 1)
++
++	// Moved call site (new line) -> miss; it must not reuse the old line's verdict.
++	pMoved := loadSSAPair(t, writeFixture(t, fixtureSrcMovedSite))
++	caMoved := newPersistentTestAnalyzer(t, cachePath, "sha-a", cfg)
++	_, hit, err := caMoved.AnalyzeCall(pMoved.fn, pMoved.call)
++	require.Error(t, err)
++	require.Equal(t, HitMiss, hit, "moving the call site must invalidate the cache")
++
++	// Changed caller function body (call on the same line/column) -> miss via caller-source hash.
++	// Committing the new-body verdict supersedes the old one for the same stable function+site,
++	// so exactly one record survives instead of accumulating stale versions.
++	p2 := loadSSAPair(t, writeFixture(t, fixtureSrcChangedBody))
++	ca2 := newPersistentTestAnalyzer(t, cachePath, "sha-a", cfg)
++	_, hit, err = ca2.AnalyzeCall(p2.fn, p2.call)
++	require.Error(t, err)
++	require.Equal(t, HitMiss, hit, "changing the caller source must invalidate the cache")
++	ca2.InsertToCache(p2.fn, p2.call, constant.FailOpen, constant.SSA)
++	require.NoError(t, ca2.Flush())
++
++	doc := readCacheDoc(t, cachePath)
++	require.Len(t, doc.Records, 1, "older code fingerprint of the identical function+site is superseded")
++	var rec storedRecord
++	for _, r := range doc.Records {
++		rec = r
++	}
++	require.Equal(t, string(constant.FailOpen), rec.Status)
++	require.Equal(t, string(constant.SSA), rec.OriginalSource)
++
++	// The new-body verdict is then reusable by the next process.
++	p3 := loadSSAPair(t, writeFixture(t, fixtureSrcChangedBody))
++	ca3 := newPersistentTestAnalyzer(t, cachePath, "sha-a", cfg)
++	info, hit, err := ca3.AnalyzeCall(p3.fn, p3.call)
++	require.NoError(t, err)
++	require.Equal(t, HitPersistent, hit)
++	require.Equal(t, constant.FailOpen, info.Status)
++}
++
++func TestPersistentCache_ConfigAndCodeVersionInvalidation(t *testing.T) {
++	t.Parallel()
++	cachePath := filepath.Join(t.TempDir(), "verdicts.json")
++	baseCfg := testVerdictConfig()
++	p := loadSSAPair(t, writeFixture(t, fixtureSrcV1))
++
++	ca1 := newPersistentTestAnalyzer(t, cachePath, "sha-a", baseCfg)
++	ca1.InsertToCache(p.fn, p.call, constant.FailClose, constant.SCCP)
++	require.NoError(t, ca1.Flush())
++
++	// Identical config/code on a fresh analyzer -> persistent hit.
++	caSame := newPersistentTestAnalyzer(t, cachePath, "sha-a", testVerdictConfig())
++	_, hit, err := caSame.AnalyzeCall(p.fn, p.call)
++	require.NoError(t, err)
++	require.Equal(t, HitPersistent, hit)
++
++	// Different code version (Git SHA) -> miss.
++	caNewSHA := newPersistentTestAnalyzer(t, cachePath, "sha-b", baseCfg)
++	_, hit, err = caNewSHA.AnalyzeCall(p.fn, p.call)
++	require.Error(t, err)
++	require.Equal(t, HitMiss, hit, "code version change must invalidate")
++
++	// Verdict-affecting option toggled -> miss.
++	cfgToggled := testVerdictConfig()
++	cfgToggled.NilOtherSourcesAfterSrc = true
++	caOpt := newPersistentTestAnalyzer(t, cachePath, "sha-a", cfgToggled)
++	_, hit, err = caOpt.AnalyzeCall(p.fn, p.call)
++	require.Error(t, err)
++	require.Equal(t, HitMiss, hit, "analyzer option change must invalidate")
++
++	// Analyzer set changed (AST disabled) -> miss.
++	cfgShorter := VerdictConfig{EnabledAnalyzers: []constant.AnalyzerKind{constant.Predefined, constant.SCCP, constant.SSA}}
++	caShort := newPersistentTestAnalyzer(t, cachePath, "sha-a", cfgShorter)
++	_, hit, err = caShort.AnalyzeCall(p.fn, p.call)
++	require.Error(t, err)
++	require.Equal(t, HitMiss, hit, "enabled analyzer set change must invalidate")
++
++	// Analyzer order changed -> miss.
++	cfgReordered := VerdictConfig{EnabledAnalyzers: []constant.AnalyzerKind{constant.AST, constant.Predefined, constant.SCCP, constant.SSA}}
++	caReorder := newPersistentTestAnalyzer(t, cachePath, "sha-a", cfgReordered)
++	_, hit, err = caReorder.AnalyzeCall(p.fn, p.call)
++	require.Error(t, err)
++	require.Equal(t, HitMiss, hit, "analyzer order change must invalidate")
++}
++
++func TestVerdictConfig_Fingerprint(t *testing.T) {
++	t.Parallel()
++	a := VerdictConfig{
++		EnabledAnalyzers:           []constant.AnalyzerKind{constant.SSA, constant.AST},
++		KnownErrorConstructorFuncs: []string{"errors.New", "fmt.Errorf"},
++	}
++	b := VerdictConfig{
++		EnabledAnalyzers:           []constant.AnalyzerKind{constant.SSA, constant.AST},
++		KnownErrorConstructorFuncs: []string{"fmt.Errorf", "errors.New"}, // different slice order
++	}
++	require.Equal(t, a.fingerprint(), b.fingerprint(), "constructor funcs are order-independent")
++
++	c := a
++	c.EnabledAnalyzers = []constant.AnalyzerKind{constant.AST, constant.SSA}
++	require.NotEqual(t, a.fingerprint(), c.fingerprint(), "analyzer order participates in the fingerprint")
++
++	d := a
++	d.NilOtherSourcesAfterSrc = true
++	require.NotEqual(t, a.fingerprint(), d.fingerprint())
++}
++
++// --- Only complete, reusable conclusions are committed --------------------------------------
++
++func TestPersistentCache_RejectsNonReusableConclusions(t *testing.T) {
++	t.Parallel()
++	cachePath := filepath.Join(t.TempDir(), "verdicts.json")
++	p := loadSSAPair(t, writeFixture(t, fixtureSrcV1))
++	ca := newPersistentTestAnalyzer(t, cachePath, "sha-a", testVerdictConfig())
++
++	rejected := []struct {
++		status constant.Failness
++		source constant.AnalyzerKind
++	}{
++		{constant.FailUnknownWithError, constant.SSA}, // chain error
++		{constant.FailOpen, constant.Unknown},        // missing source
++		{constant.FailClose, constant.CacheAnalyzerKind}, // cache facade is not a real producer
++		{constant.Failness("Bogus"), constant.SSA},   // invalid status
++	}
++	for _, r := range rejected {
++		ca.InsertToCache(p.fn, p.call, r.status, r.source)
++		_, _, err := ca.AnalyzeCall(p.fn, p.call)
++		require.Error(t, err, "rejected conclusion must not be served (status=%s source=%s)", r.status, r.source)
++	}
++	require.GreaterOrEqual(t, ca.Metrics().InvalidRecords, int64(len(rejected)))
++	require.NoError(t, ca.Flush())
++
++	// With nothing reusable committed, the flush creates no file (or an empty document).
++	if _, statErr := os.Stat(cachePath); statErr == nil {
++		doc := readCacheDoc(t, cachePath)
++		require.Empty(t, doc.Records, "no rejected conclusion may be persisted")
++	}
++
++	// A valid conclusion is still served and persisted.
++	ca.InsertToCache(p.fn, p.call, constant.FailUnknown, constant.SCCP) // plain Unknown from a real analyzer is reusable
++	info, hit, err := ca.AnalyzeCall(p.fn, p.call)
++	require.NoError(t, err)
++	require.Equal(t, HitInProcess, hit)
++	require.Equal(t, constant.FailUnknown, info.Status)
++	require.NoError(t, ca.Flush())
++	doc := readCacheDoc(t, cachePath)
++	require.Len(t, doc.Records, 1)
++}
++
++// --- Corruption / unsupported schema ----------------------------------------------------------
++
++func TestPersistentCache_CorruptFileSalvaged(t *testing.T) {
++	t.Parallel()
++	dir := t.TempDir()
++	cachePath := filepath.Join(dir, "verdicts.json")
++	require.NoError(t, os.WriteFile(cachePath, []byte("{not json"), 0o644))
++
++	ca := newPersistentTestAnalyzer(t, cachePath, "sha-a", testVerdictConfig())
++	m := ca.Metrics()
++	require.Equal(t, int64(1), m.LoadFailures)
++
++	p := loadSSAPair(t, writeFixture(t, fixtureSrcV1))
++	_, hit, err := ca.AnalyzeCall(p.fn, p.call)
++	require.Error(t, err)
++	require.Equal(t, HitMiss, hit, "corrupt file must not yield hits, analysis falls through to the chain")
++
++	ca.InsertToCache(p.fn, p.call, constant.FailClose, constant.SCCP)
++	require.NoError(t, ca.Flush())
++
++	// Cache re-established from the same run; old bytes preserved as a backup.
++	ca2 := newPersistentTestAnalyzer(t, cachePath, "sha-a", testVerdictConfig())
++	_, hit, err = ca2.AnalyzeCall(p.fn, p.call)
++	require.NoError(t, err)
++	require.Equal(t, HitPersistent, hit)
++	backups, err := filepath.Glob(filepath.Join(dir, "verdicts.json.corrupt-*"))
++	require.NoError(t, err)
++	require.NotEmpty(t, backups, "corrupt file must be preserved for inspection")
++}
++
++func TestPersistentCache_PartiallyInvalidRecords(t *testing.T) {
++	t.Parallel()
++	cachePath := filepath.Join(t.TempDir(), "verdicts.json")
++	p := loadSSAPair(t, writeFixture(t, fixtureSrcV1))
++
++	// Seed a valid record through a real analyzer, then tamper one extra record into the file.
++	ca := newPersistentTestAnalyzer(t, cachePath, "sha-a", testVerdictConfig())
++	ca.InsertToCache(p.fn, p.call, constant.FailClose, constant.SCCP)
++	require.NoError(t, ca.Flush())
++	doc := readCacheDoc(t, cachePath)
++	doc.Records["deadbeef"] = storedRecord{
++		Key: "deadbeef", SchemaVersion: currentSchemaVersion, ToolVersion: currentToolVersion,
++		StableID: "x", Status: string(constant.FailUnknownWithError), OriginalSource: string(constant.SSA),
++		CodeFingerprint: "c", ConfigFingerprint: "f",
++	}
++	writeCacheDoc(t, cachePath, doc)
++
++	ca2 := newPersistentTestAnalyzer(t, cachePath, "sha-a", testVerdictConfig())
++	require.Equal(t, int64(1), ca2.Metrics().InvalidRecords)
++	info, hit, err := ca2.AnalyzeCall(p.fn, p.call)
++	require.NoError(t, err)
++	require.Equal(t, HitPersistent, hit)
++	require.Equal(t, constant.FailClose, info.Status)
++}
++
++func TestPersistentCache_UnsupportedSchemaPreserved(t *testing.T) {
++	t.Parallel()
++	cachePath := filepath.Join(t.TempDir(), "verdicts.json")
++	original, err := json.Marshal(cacheFile{SchemaVersion: "v999", ToolVersion: 99, Records: map[string]storedRecord{}})
++	require.NoError(t, err)
++	require.NoError(t, os.WriteFile(cachePath, original, 0o644))
++
++	ca := newPersistentTestAnalyzer(t, cachePath, "sha-a", testVerdictConfig())
++	require.Equal(t, int64(1), ca.Metrics().LoadFailures)
++
++	p := loadSSAPair(t, writeFixture(t, fixtureSrcV1))
++	ca.InsertToCache(p.fn, p.call, constant.FailClose, constant.SCCP)
++	require.NoError(t, ca.Flush())
++	require.Equal(t, int64(1), ca.Metrics().WriteDegraded, "older tool must not clobber a newer-schema cache")
++
++	after, err := os.ReadFile(cachePath)
++	require.NoError(t, err)
++	require.JSONEq(t, string(original), string(after), "newer-schema document must be left untouched")
++}
++
++func TestPersistentCache_NewerToolVersionPreserved(t *testing.T) {
++	t.Parallel()
++	cachePath := filepath.Join(t.TempDir(), "verdicts.json")
++	doc := cacheFile{SchemaVersion: currentSchemaVersion, ToolVersion: currentToolVersion + 1, Records: map[string]storedRecord{}}
++	writeCacheDoc(t, cachePath, doc)
++
++	ca := newPersistentTestAnalyzer(t, cachePath, "sha-a", testVerdictConfig())
++	require.Equal(t, int64(1), ca.Metrics().LoadFailures)
++	p := loadSSAPair(t, writeFixture(t, fixtureSrcV1))
++	ca.InsertToCache(p.fn, p.call, constant.FailClose, constant.SCCP)
++	require.NoError(t, ca.Flush())
++	require.Equal(t, int64(1), ca.Metrics().WriteDegraded)
++}
++
++// --- Read-only / unwritable directory ---------------------------------------------------------
++
++func TestPersistentCache_ReadOnlyDirDegradesAndRecovers(t *testing.T) {
++	if os.Geteuid() == 0 {
++		t.Skip("permission semantics do not apply when running as root")
++	}
++	if runtime.GOOS == "windows" {
++		t.Skip("chmod permission model differs on windows")
++	}
++	t.Parallel()
++	dir := t.TempDir()
++	require.NoError(t, os.Chmod(dir, 0o555))
++	t.Cleanup(func() { _ = os.Chmod(dir, 0o755) })
++	cachePath := filepath.Join(dir, "verdicts.json")
++
++	ca := newPersistentTestAnalyzer(t, cachePath, "sha-a", testVerdictConfig())
++	p := loadSSAPair(t, writeFixture(t, fixtureSrcV1))
++
++	// Analysis path stays fully functional: lookups miss, no panic, no verdict impact.
++	_, hit, err := ca.AnalyzeCall(p.fn, p.call)
++	require.Error(t, err)
++	require.Equal(t, HitMiss, hit)
++	ca.InsertToCache(p.fn, p.call, constant.FailClose, constant.SCCP)
++	flushErr := ca.Flush()
++	require.Error(t, flushErr, "flush reports the degradation")
++	require.GreaterOrEqual(t, ca.Metrics().WriteDegraded, int64(1))
++	require.NoFileExists(t, cachePath)
++
++	// Permissions recover -> later runs establish the cache as usual.
++	require.NoError(t, os.Chmod(dir, 0o755))
++	ca2 := newPersistentTestAnalyzer(t, cachePath, "sha-a", testVerdictConfig())
++	ca2.InsertToCache(p.fn, p.call, constant.FailClose, constant.SCCP)
++	require.NoError(t, ca2.Flush())
++	require.FileExists(t, cachePath)
++	ca3 := newPersistentTestAnalyzer(t, cachePath, "sha-a", testVerdictConfig())
++	_, hit, err = ca3.AnalyzeCall(p.fn, p.call)
++	require.NoError(t, err)
++	require.Equal(t, HitPersistent, hit)
++}
++
++// --- Concurrent processes (simulated by independent stores) ----------------------------------
++
++func TestPersistentCache_ConcurrentIndependentWriters(t *testing.T) {
++	t.Parallel()
++	cachePath := filepath.Join(t.TempDir(), "verdicts.json")
++
++	const writers = 8
++	const perWriter = 25
++	var wg sync.WaitGroup
++	// A reader continuously re-opens the cache; every version it observes must parse (no torn
++	// reads thanks to temp-file + rename).
++	stop := make(chan struct{})
++	readerErr := make(chan error, 1)
++	go func() {
++		for {
++			select {
++			case <-stop:
++				readerErr <- nil
++				return
++			default:
++				if data, err := os.ReadFile(cachePath); err == nil {
++					var doc cacheFile
++					if err := json.Unmarshal(data, &doc); err != nil {
++						readerErr <- err
++						return
++					}
++				}
++			}
++		}
++	}()
++
++	for w := 0; w < writers; w++ {
++		wg.Add(1)
++		go func(w int) {
++			defer wg.Done()
++			ctr := &counters{}
++			s := newPersistentStore(cachePath, zap.NewNop().Sugar(), ctr, func() time.Time { return time.Now().UTC() }, 1_000_000)
++			for i := 0; i < perWriter; i++ {
++				key := fmt.Sprintf("writer%d-record%d", w, i)
++				s.add(syntheticRecord(key, fmt.Sprintf("site-%d-%d", w, i)))
++			}
++			if err := s.flush(); err != nil {
++				t.Errorf("writer %d flush: %v", w, err)
++			}
++		}(w)
++	}
++	wg.Wait()
++	close(stop)
++	require.NoError(t, <-readerErr, "reader never observed a partially written document")
++
++	// Union of all writers survives.
++	final := newPersistentStore(cachePath, zap.NewNop().Sugar(), &counters{}, func() time.Time { return time.Now().UTC() }, 1_000_000)
++	require.Equal(t, writers*perWriter, len(final.records))
++
++	// Overlapping writes (same record from multiple writers) converge without corruption.
++	var wg2 sync.WaitGroup
++	for w := 0; w < writers; w++ {
++		wg2.Add(1)
++		go func() {
++			defer wg2.Done()
++			ctr := &counters{}
++			s := newPersistentStore(cachePath, zap.NewNop().Sugar(), ctr, func() time.Time { return time.Now().UTC() }, 1_000_000)
++			s.add(syntheticRecord("shared-key", "shared-site"))
++			require.NoError(t, s.flush())
++		}()
++	}
++	wg2.Wait()
++	final2 := newPersistentStore(cachePath, zap.NewNop().Sugar(), &counters{}, func() time.Time { return time.Now().UTC() }, 1_000_000)
++	require.Len(t, final2.records, writers*perWriter+1)
++}
++
++func TestPersistentCache_IntermediateFlushThreshold(t *testing.T) {
++	t.Parallel()
++	cachePath := filepath.Join(t.TempDir(), "verdicts.json")
++	ctr := &counters{}
++	s := newPersistentStore(cachePath, zap.NewNop().Sugar(), ctr, func() time.Time { return time.Now().UTC() }, 2)
++	s.add(syntheticRecord("k1", "site1"))
++	s.add(syntheticRecord("k2", "site2")) // triggers threshold flush
++	require.FileExists(t, cachePath)
++	doc := readCacheDoc(t, cachePath)
++	require.Len(t, doc.Records, 2)
++	s.mu.Lock()
++	require.Empty(t, s.pending)
++	s.mu.Unlock()
++
++	s.add(syntheticRecord("k3", "site3")) // below threshold, stays pending until explicit flush
++	doc = readCacheDoc(t, cachePath)
++	require.Len(t, doc.Records, 2)
++	require.NoError(t, s.flush())
++	doc = readCacheDoc(t, cachePath)
++	require.Len(t, doc.Records, 3)
++}
++
++// --- Stable identity helpers ------------------------------------------------------------------
++
++func TestNormalizeFile(t *testing.T) {
++	t.Parallel()
++	for _, tc := range []struct {
++		name     string
++		filename string
++		pkgPath  string
++		want     string
++	}{
++		{
++			name:     "lifted gopath",
++			filename: "/tmp/gopath-123/src/example.internal/svc/handler.go",
++			pkgPath:  "example.internal/svc",
++			want:     "example.internal/svc/handler.go",
++		},
++		{
++			name:     "bazel sandbox",
++			filename: "/private/var/tmp/_bazel/x/execroot/w/src/example.internal/svc/sub/h.go",
++			pkgPath:  "example.internal/svc/sub",
++			want:     "example.internal/svc/sub/h.go",
++		},
++		{
++			name:     "module cache keeps version",
++			filename: "/go/pkg/mod/example.com/foo@v1.2.3/x/a.go",
++			pkgPath:  "example.com/foo@v1.2.3/x",
++			want:     "example.com/foo@v1.2.3/x/a.go",
++		},
++		{
++			name:     "pkg path not found falls back to base",
++			filename: "/somewhere/else/a.go",
++			pkgPath:  "example.internal/svc",
++			want:     "a.go",
++		},
++	} {
++		t.Run(tc.name, func(t *testing.T) {
++			require.Equal(t, tc.want, normalizeFile(tc.filename, tc.pkgPath))
++		})
++	}
++}
++
++// --- helpers ----------------------------------------------------------------------------------
++
++func syntheticRecord(key, stableID string) storedRecord {
++	return storedRecord{
++		Key:               key,
++		SchemaVersion:     currentSchemaVersion,
++		ToolVersion:       currentToolVersion,
++		StableID:          stableID,
++		Status:            string(constant.FailClose),
++		OriginalSource:    string(constant.SCCP),
++		CodeFingerprint:   "code-" + key,
++		ConfigFingerprint: "cfg",
++		CreatedAt:         time.Now().UTC().Format(timestampLayout),
++	}
++}
++
++func readCacheDoc(t *testing.T, path string) cacheFile {
++	t.Helper()
++	data, err := os.ReadFile(path)
++	require.NoError(t, err)
++	var doc cacheFile
++	require.NoError(t, json.Unmarshal(data, &doc), "cache file must be valid JSON")
++	return doc
++}
++
++func writeCacheDoc(t *testing.T, path string, doc cacheFile) {
++	t.Helper()
++	data, err := json.MarshalIndent(doc, "", "  ")
++	require.NoError(t, err)
++	require.NoError(t, os.WriteFile(path, data, 0o644))
++}

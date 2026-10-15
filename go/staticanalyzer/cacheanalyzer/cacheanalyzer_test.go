@@ -17,8 +17,9 @@ func TestAnalyzeCallNotFound(t *testing.T) {
 	dummyCall := &ssa.Call{}
 
 	// Since nothing is inserted, AnalyzeCall should return FailUnknown with an error.
-	fail, err := ca.AnalyzeCall(dummyFunc, dummyCall)
+	fail, hitKind, err := ca.AnalyzeCall(dummyFunc, dummyCall)
 	require.Error(t, err)
+	require.Equal(t, HitMiss, hitKind)
 	require.Equal(t, constant.FailUnknown, fail.Status)
 }
 
@@ -36,8 +37,9 @@ func TestInsertAndAnalyzeCall(t *testing.T) {
 	ca.InsertToCache(dummyFunc, dummyCall, expectedFail, constant.SSA)
 
 	// Now AnalyzeCall should return the inserted failness without error.
-	fail, err := ca.AnalyzeCall(dummyFunc, dummyCall)
+	fail, hitKind, err := ca.AnalyzeCall(dummyFunc, dummyCall)
 	require.NoError(t, err)
+	require.Equal(t, HitInProcess, hitKind)
 	require.Equal(t, expectedFail, fail.Status)
 	require.Equal(t, constant.SSA, fail.Source)
 }

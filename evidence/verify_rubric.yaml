@@ -1,0 +1,25 @@
+rubrics:
+  - id: 1
+    type: f2p
+    text: CLI 和库选项可为启用的 Cache analyzer 指定持久缓存位置；未配置该位置时不创建磁盘状态并保持当前 Driver 内存缓存、analyzer 顺序和默认命令行为。
+  - id: 2
+    type: f2p
+    text: 持久 key 在 SSA 重新构建和新 Driver/进程中保持稳定，并绑定代码版本、caller/callsite 的包、函数和源位置、缓存或工具 schema 以及所有会影响 verdict 的 analyzer 配置；任一相关输入变化都会 miss。
+  - id: 3
+    type: f2p
+    text: 版本化记录完整往返 failness 与实际 OriginalSource；第二次等价运行从持久缓存返回 Source=Cache 和正确来源，不执行原本命中的昂贵 analyzer，最终路径与报告 verdict 和未缓存重算一致。
+  - id: 4
+    type: f2p
+    text: 两个进程向同一缓存提交不同有效记录时通过跨进程协调、合并和原子替换保留双方结果；在编码、同步或替换阶段中止后，旧缓存仍完整可读且临时文件不会被当作命中。
+  - id: 5
+    type: f2p
+    text: analyzer error、panic、FailUnknownWithError、缺失有效 OriginalSource 或未完成输出不会持久化；损坏记录、未知 schema 或 key 校验失败被拒绝并按正常 analyzer 链重算，不会改变 failness。
+  - id: 6
+    type: f2p
+    text: 缓存目录不可写或发布失败时，本次已计算 verdict 仍正常返回且旧缓存保持可用；诊断和 metrics 标明降级，权限或存储故障解除后的后续运行能够成功提交并再次命中。
+  - id: 7
+    type: f2p
+    text: 相同源码和配置跨 Driver 或进程产生持久命中，代码版本、调用位置、analyzer 选择或相关 SCCP 配置变化只使对应记录失效，其他仍匹配的有效记录可以继续复用。
+  - id: 8
+    type: p2p
+    text: 结果 metrics 可分别统计进程内命中、持久命中、miss、拒绝或失效记录和写入降级；未启用持久层及正常无故障分析的 status、OriginalSource、报告格式和既有测试保持兼容。

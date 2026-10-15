@@ -1061,3 +1061,162 @@ func TestEnrichReportMetrics(t *testing.T) {
 	assert.Equal(t, 0, r2.Total.FailOpen)
 	assert.Equal(t, 0, r2.Total.FailUnknown)
 }
+
+// edgeVerdictMultiset builds a comparable multiset of per-edge verdicts (caller, callee, status)
+// from AnalyzerMetrics, deliberately ignoring the producing source so cold (SCCP/SSA/AST) and warm
+// (Cache backed) runs can be compared verdict-by-verdict.
+func edgeVerdictMultiset(r Result) map[string]int {
+	m := make(map[string]int)
+	for _, row := range r.AnalyzerMetrics {
+		m[row["caller"]+"\x00"+row["callee"]+"\x00"+row["edge_result"]]++
+	}
+	return m
+}
+
+// cacheBackedEdgeCount counts edges served from the Cache analyzer (Source=Cache, OriginalSource
+// names the analyzer that first produced the verdict).
+func cacheBackedEdgeCount(r Result) int {
+	n := 0
+	for _, row := range r.AnalyzerMetrics {
+		if strings.HasPrefix(row["edge_result_source"], string(constant.CacheAnalyzerKind)) {
+			n++
+		}
+	}
+	return n
+}
+
+func persistentCacheTestDriver(t *testing.T, cachePath, gitSHA string, analyzers map[constant.AnalyzerKind]bool) (*Driver, grail.Service) {
+	t.Helper()
+	ctrl := gomock.NewController(t)
+	runner := utilsmock.NewMockRunner(ctrl)
+	runner.EXPECT().Run(gomock.Any()).DoAndReturn(func(cmd *exec.Cmd) error { return nil }).AnyTimes()
+	aiClient := genaimock.NewMockClient(ctrl)
+	lotteryService := grail.Service{Name: "lottery", Tier: 3}
+	clientTypeToService := servicemapping.ServiceMapping{}
+	clientTypeToService.AddMappings(
+		servicemapping.FullyQualifiedType{PkgPath: "thriftrw/lottery/lotteryclient", Name: "Interface"},
+		&servicemapping.ServiceWithIDLInfo{Service: lotteryService},
+	)
+	serviceMapper := servicemapping.New([]grail.Service{lotteryService}, clientTypeToService, nil /* logger */)
+
+	opts := _defaultDriverOptions
+	opts.OutputDir = t.TempDir()
+	opts.Timestamp = "2026-01-01T00:00:00Z"
+	opts.PersistentCachePath = cachePath
+	opts.GitSHA = gitSHA
+	if analyzers != nil {
+		opts.Analyzers = analyzers
+	}
+
+	driver := NewDriver(t.TempDir() /* workspace */, runner, nil /* GoPathWrapper */, serviceMapper, aiClient,
+		nil /* AllServices */, nil /* productionTrafficRecords */, nil /* logger */, opts)
+	curService := grail.Service{Name: "rpcshielddemo", Tier: 2}
+	return driver, curService
+}
+
+func runPersistentCacheDriver(t *testing.T, driver *Driver, curService grail.Service) Result {
+	t.Helper()
+	targets := []string{"//src/github.com/uber-research/rpcshield/go/exampleapps/rpcshielddemo:rpcshielddemo"}
+	result, err := driver.RunOnPackages(context.Background(), curService, targets, rpcshieldtest.LoadrpcshieldDemoPackages().All)
+	require.NoError(t, err)
+	require.Equal(t, Success, result.Status)
+	return result
+}
+
+// TestDriver_PersistentCache_CrossDriverReuse verifies a finished run persists reusable
+// caller/callsite verdicts, a second process-shaped run (fresh Driver, rebuilt SSA pointers, same
+// cache file) serves them from the persistent layer without changing any verdict, and that code
+// version or analyzer-configuration changes produce misses instead of stale hits.
+func TestDriver_PersistentCache_CrossDriverReuse(t *testing.T) {
+	t.Parallel()
+
+	cachePath := filepath.Join(t.TempDir(), "verdict-cache.json")
+
+	// Cold run: no cache file yet. Every cached lookup misses and the analyzer chain repopulates it.
+	coldDriver, curService := persistentCacheTestDriver(t, cachePath, "git-sha-1", nil)
+	cold := runPersistentCacheDriver(t, coldDriver, curService)
+	require.FileExists(t, cachePath)
+	require.Equal(t, float64(0), cold.RunMetrics[_analyzerCachePersistentHitCount])
+	require.Greater(t, cold.RunMetrics[_analyzerCacheMissCount], float64(0))
+	require.Equal(t, float64(0), cold.RunMetrics[_analyzerCacheLoadFailureCount])
+	require.Equal(t, float64(0), cold.RunMetrics[_analyzerCacheWriteDegradedCount])
+	coldEdges := edgeVerdictMultiset(cold)
+	require.NotEmpty(t, coldEdges)
+
+	// Warm run: independent Driver instance with a fresh SSA build reusing the same cache file.
+	warmDriver, _ := persistentCacheTestDriver(t, cachePath, "git-sha-1", nil)
+	warm := runPersistentCacheDriver(t, warmDriver, curService)
+	require.Greater(t, warm.RunMetrics[_analyzerCachePersistentHitCount], float64(0), "second process must reuse finished caller/callsite verdicts")
+	require.Equal(t, float64(0), warm.RunMetrics[_analyzerCacheLoadFailureCount])
+	require.Equal(t, float64(0), warm.RunMetrics[_analyzerCacheWriteDegradedCount])
+	require.Greater(t, cacheBackedEdgeCount(warm), 0, "warm edges must be attributed to the Cache analyzer with real OriginalSource")
+	// Every edge verdict (failness) is identical even though the chain was largely skipped.
+	require.Equal(t, coldEdges, edgeVerdictMultiset(warm))
+	require.Equal(t, cold.FailnessMetrics, warm.FailnessMetrics)
+
+	// Different analyzed code version -> no persistent hits, verdicts still computed by the chain.
+	newShaDriver, _ := persistentCacheTestDriver(t, cachePath, "git-sha-2", nil)
+	newSHA := runPersistentCacheDriver(t, newShaDriver, curService)
+	require.Equal(t, float64(0), newSHA.RunMetrics[_analyzerCachePersistentHitCount])
+	require.Greater(t, newSHA.RunMetrics[_analyzerCacheMissCount], float64(0))
+	require.Equal(t, coldEdges, edgeVerdictMultiset(newSHA))
+	require.Equal(t, cold.FailnessMetrics, newSHA.FailnessMetrics)
+
+	// Different verdict-affecting analyzer configuration (SCCP removed from the chain) -> miss.
+	analyzersNoSCCP := map[constant.AnalyzerKind]bool{
+		constant.CacheAnalyzerKind: true,
+		constant.Predefined:        true,
+		constant.SSA:               true,
+		constant.AST:               true,
+		constant.LLM:               true,
+	}
+	cfgDriver, _ := persistentCacheTestDriver(t, cachePath, "git-sha-1", analyzersNoSCCP)
+	cfgResult := runPersistentCacheDriver(t, cfgDriver, curService)
+	require.Equal(t, float64(0), cfgResult.RunMetrics[_analyzerCachePersistentHitCount])
+	require.Greater(t, cfgResult.RunMetrics[_analyzerCacheMissCount], float64(0))
+}
+
+// TestDriver_PersistentCache_CorruptionAndReadOnlyDegrade verifies cache problems never change
+// the analysis verdict: corruption is salvaged with a diagnostic and an unwritable cache
+// directory degrades writes, while the normal analyzer chain produces identical results.
+func TestDriver_PersistentCache_CorruptionAndReadOnlyDegrade(t *testing.T) {
+	t.Parallel()
+	if os.Geteuid() == 0 {
+		t.Skip("permission semantics do not apply when running as root")
+	}
+
+	cacheDir := t.TempDir()
+	cachePath := filepath.Join(cacheDir, "verdict-cache.json")
+
+	// Baseline run to capture verdicts without persistence issues.
+	baseDriver, curService := persistentCacheTestDriver(t, cachePath, "git-sha-x", nil)
+	base := runPersistentCacheDriver(t, baseDriver, curService)
+	baseEdges := edgeVerdictMultiset(base)
+	require.FileExists(t, cachePath)
+
+	// Corrupt the file mid-way: the next driver must observe a load failure diagnostic, fall back
+	// to the chain for every edge, salvage the file, and still return identical verdicts.
+	require.NoError(t, os.WriteFile(cachePath, []byte("{{corrupt"), 0o644))
+	corruptDriver, _ := persistentCacheTestDriver(t, cachePath, "git-sha-x", nil)
+	corrupt := runPersistentCacheDriver(t, corruptDriver, curService)
+	require.Greater(t, corrupt.RunMetrics[_analyzerCacheLoadFailureCount], float64(0))
+	require.Equal(t, float64(0), corrupt.RunMetrics[_analyzerCachePersistentHitCount])
+	require.Equal(t, baseEdges, edgeVerdictMultiset(corrupt))
+	require.Equal(t, base.FailnessMetrics, corrupt.FailnessMetrics)
+	// Salvage + repopulation makes the cache reusable by the next run.
+	recoverDriver, _ := persistentCacheTestDriver(t, cachePath, "git-sha-x", nil)
+	recovered := runPersistentCacheDriver(t, recoverDriver, curService)
+	require.Greater(t, recovered.RunMetrics[_analyzerCachePersistentHitCount], float64(0))
+	require.Equal(t, baseEdges, edgeVerdictMultiset(recovered))
+
+	// Read-only cache directory: reads/writes degrade observably without touching the verdict.
+	require.NoError(t, os.Chmod(cacheDir, 0o555))
+	t.Cleanup(func() { _ = os.Chmod(cacheDir, 0o755) })
+	roPath := filepath.Join(cacheDir, "readonly-cache.json")
+	roDriver, _ := persistentCacheTestDriver(t, roPath, "git-sha-y", nil)
+	ro := runPersistentCacheDriver(t, roDriver, curService)
+	require.Greater(t, ro.RunMetrics[_analyzerCacheWriteDegradedCount], float64(0))
+	require.Equal(t, float64(0), ro.RunMetrics[_analyzerCachePersistentHitCount])
+	require.Equal(t, baseEdges, edgeVerdictMultiset(ro))
+	require.Equal(t, base.FailnessMetrics, ro.FailnessMetrics)
+}
